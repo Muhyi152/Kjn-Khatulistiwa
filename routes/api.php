@@ -99,8 +99,10 @@ $checkIsAdmin = function (Request $request = null, $identifier = null) use ($res
 // =========================================================================
 $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
     try {
+        $reqUser = null;
         if ($identifier instanceof Request) {
             $req = $identifier;
+            $reqUser = $resolveCurrentUser($req);
             $identifier = $req->query('customer_id') 
                 ?? $req->input('customer_id') 
                 ?? $req->header('X-Customer-Id')
@@ -112,9 +114,8 @@ $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
                 ?? $req->query('email') 
                 ?? $req->input('email');
             
-            if (empty($identifier)) {
-                $user = $resolveCurrentUser($req);
-                if ($user) $identifier = $user->email ?? $user->id;
+            if (empty($identifier) && $reqUser) {
+                $identifier = $reqUser->id;
             }
         } elseif (is_array($identifier)) {
             $identifier = $identifier['customer_id'] ?? $identifier['user_id'] ?? $identifier['id'] ?? $identifier['email'] ?? null;
@@ -150,39 +151,38 @@ $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
                         if ($c) return $c;
                     }
                     if ($hasNamaCol && !empty($u->name)) {
-                        $namaDepan = explode(' ', trim($u->name))[0];
-                        $c = Customer::where('nama', 'LIKE', '%' . $namaDepan . '%')->first();
+                        $c = Customer::where('nama', $u->name)->first();
                         if ($c) return $c;
                     }
                 }
 
                 if ($hasNamaCol) {
-                    $c = Customer::where('nama', 'LIKE', '%' . $identifier . '%')->first();
+                    $c = Customer::where('nama', $identifier)->first();
                     if ($c) return $c;
                 }
             }
         }
 
-        if (Auth::check()) {
-            $user = Auth::user();
+        $currentUser = Auth::user() ?? $reqUser;
+        if ($currentUser) {
             if ($hasUserIdCol) {
-                $c = Customer::where('user_id', $user->id)->first();
+                $c = Customer::where('user_id', $currentUser->id)->first();
                 if ($c) return $c;
             }
-            if ($hasEmailCol && !empty($user->email)) {
-                $c = Customer::where('email', $user->email)->first();
+            if ($hasEmailCol && !empty($currentUser->email)) {
+                $c = Customer::where('email', $currentUser->email)->first();
                 if ($c) return $c;
             }
-            if ($hasNamaCol && !empty($user->name)) {
-                $namaDepan = explode(' ', trim($user->name))[0];
-                $c = Customer::where('nama', 'LIKE', '%' . $namaDepan . '%')->first();
+            if ($hasNamaCol && !empty($currentUser->name)) {
+                $c = Customer::where('nama', $currentUser->name)->first();
                 if ($c) return $c;
             }
         }
 
-        return Customer::first();
+        // Jangan pernah fallback ke Customer::first() agar tidak nyasar ke user lain
+        return null;
     } catch (\Throwable $e) {
-        return Customer::first();
+        return null;
     }
 };
 
@@ -275,19 +275,21 @@ $saveNotifState = function ($userKey, array $update) {
 // =========================================================================
 // HELPER FORMAT PROFIL CUSTOMER
 // =========================================================================
-$formatCustomerProfile = function ($customer) use ($resolveCustomer) {
-    if (!$customer) {
-        $customer = $resolveCustomer();
+$formatCustomerProfile = function ($customer = null, Request $request = null) use ($resolveCustomer, $resolveCurrentUser) {
+    if (!$customer && $request) {
+        $customer = $resolveCustomer($request);
     }
+
     if (!$customer) {
+        $user = $request ? $resolveCurrentUser($request) : (Auth::check() ? Auth::user() : null);
         return response()->json([
             'success' => true,
             'data'    => [
-                'id'                 => '1',
-                'user_id'            => '1',
-                'nama'               => 'Pelanggan Baru',
-                'name'               => 'Pelanggan Baru',
-                'email'              => '-',
+                'id'                 => (string) ($user ? $user->id : '0'),
+                'user_id'            => (string) ($user ? $user->id : '0'),
+                'nama'               => $user ? $user->name : 'Pelanggan Baru',
+                'name'               => $user ? $user->name : 'Pelanggan Baru',
+                'email'              => $user ? $user->email : '-',
                 'no_hp'              => '-',
                 'username_pppoe'     => '-',
                 'nama_paket'         => 'Belum Ada Paket Aktif',
@@ -354,7 +356,6 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
         $tglJatuhTempoStr= $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : '-';
         $tenggatWaktu    = $masihMasaAktif ? "LUNAS • Aktif s.d. {$tglJatuhTempoStr}" : "MASA AKTIF HABIS (Isolir)";
     } else {
-        // BELUM PERNAH BERLANGGANAN SAMA SEKALI
         $tagihanRiil     = 0.0;
         $statusLangganan = 'BELUM_AKTIF';
         $statusKoneksi   = 'Offline';
@@ -513,13 +514,13 @@ $handlerAdminDashboard = function (Request $request) {
 
 Route::get('/admin/dashboard', fn(Request $r) => $handlerAdminDashboard($r));
 Route::get('/customer/dashboard', function (Request $r) use ($resolveCustomer, $formatCustomerProfile) {
-    return $formatCustomerProfile($resolveCustomer($r));
+    return $formatCustomerProfile($resolveCustomer($r), $r);
 });
 Route::get('/dashboard', function (Request $r) use ($resolveCustomer, $formatCustomerProfile, $handlerAdminDashboard, $checkIsAdmin) {
     if ($checkIsAdmin($r)) {
         return $handlerAdminDashboard($r);
     }
-    return $formatCustomerProfile($resolveCustomer($r));
+    return $formatCustomerProfile($resolveCustomer($r), $r);
 });
 
 // =========================================================================
@@ -911,7 +912,9 @@ Route::get('/notifikasi', function (Request $r) use ($handlerAdminNotifications,
     return $handlerCustomerNotifications($r);
 });
 
-// Mark all read
+// =========================================================================
+// MARK ALL READ NOTIFIKASI
+// =========================================================================
 $handlerMarkAllReadAdmin = function () use ($saveNotifState) {
     $maxInvoiceId = (int) (Invoice::max('id') ?? 0);
     $saveNotifState('admin_system_notifications', [
@@ -1354,12 +1357,7 @@ Route::post('/login', function (Request $request) {
         }
 
         if (!$customer && Schema::hasColumn('customers', 'nama') && !empty($user->name)) {
-            $namaDepan = explode(' ', trim($user->name))[0];
-            $customer = Customer::where('nama', 'LIKE', '%' . $namaDepan . '%')->first();
-        }
-
-        if (!$customer && in_array(strtolower($user->role ?? ''), ['customer', 'pelanggan'])) {
-            $customer = Customer::first();
+            $customer = Customer::where('nama', $user->name)->first();
         }
 
         $token = null;
@@ -1415,35 +1413,60 @@ Route::post('/register', function (Request $request) {
         $role = strtolower(trim($request->input('role', 'customer')));
         $noHp = $request->input('phone') ?? $request->input('no_hp') ?? '';
 
-        // 1. Buat data User
-        $user = User::create([
-            'name'     => $validated['name'],
-            'email'    => $validated['email'],
-            'password' => bcrypt($validated['password']),
-            'role'     => $role,
-        ]);
+        // Gunakan Transaction agar tidak ada akun orphan jika salah satu query gagal
+        $result = DB::transaction(function () use ($validated, $role, $noHp) {
+            // 1. Simpan akun ke tabel users
+            $user = User::create([
+                'name'     => $validated['name'],
+                'email'    => $validated['email'],
+                'password' => bcrypt($validated['password']),
+                'role'     => $role,
+            ]);
 
-        // 2. Buat profil Customer yang tersambung ke user_id
-           // 2. Buat profil Customer yang tersambung ke user_id
-        $customerData = [
-            'nama'           => $user->name,
-            'email'          => $user->email,
-            'status'         => 'BELUM_AKTIF',
-            'status_koneksi' => 'Offline',
-            'nama_paket'     => null,
-        ];
+            // 2. Siapkan data customer secara aman (hanya masukkan field yang benar-benar ada di tabel Railway)
+            $customerData = [];
 
-        if (Schema::hasColumn('customers', 'user_id')) {
-            $customerData['user_id'] = $user->id;
-        }
-        if (Schema::hasColumn('customers', 'no_wa')) {
-            $customerData['no_wa'] = $noHp;
-        }
-        if (Schema::hasColumn('customers', 'no_hp')) {
-            $customerData['no_hp'] = $noHp;
-        }
+            if (Schema::hasColumn('customers', 'nama')) {
+                $customerData['nama'] = $user->name;
+            } elseif (Schema::hasColumn('customers', 'name')) {
+                $customerData['name'] = $user->name;
+            }
 
-        $customer = Customer::create($customerData);
+            if (Schema::hasColumn('customers', 'user_id')) {
+                $customerData['user_id'] = $user->id;
+            }
+            if (Schema::hasColumn('customers', 'email')) {
+                $customerData['email'] = $user->email;
+            }
+            if (Schema::hasColumn('customers', 'no_wa')) {
+                $customerData['no_wa'] = $noHp;
+            }
+            if (Schema::hasColumn('customers', 'no_hp')) {
+                $customerData['no_hp'] = $noHp;
+            }
+            if (Schema::hasColumn('customers', 'status')) {
+                $customerData['status'] = 'BELUM_AKTIF';
+            }
+            if (Schema::hasColumn('customers', 'status_koneksi')) {
+                $customerData['status_koneksi'] = 'Offline';
+            }
+            if (Schema::hasColumn('customers', 'nama_paket')) {
+                $customerData['nama_paket'] = null;
+            }
+            if (Schema::hasColumn('customers', 'product_id')) {
+                $customerData['product_id'] = null;
+            }
+
+            $customer = Customer::create($customerData);
+
+            return [
+                'user'     => $user,
+                'customer' => $customer,
+            ];
+        });
+
+        $user = $result['user'];
+        $customer = $result['customer'];
 
         // 3. Buat Token Autentikasi
         $token = null;
