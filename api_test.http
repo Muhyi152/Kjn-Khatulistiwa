@@ -1,0 +1,193 @@
+### 1. CEK SEMUA PAKET INTERNET (GET)
+GET http://localhost:8000/api/products
+Accept: application/json
+
+###
+
+### 2. UPDATE PAKET & FOTO GAMBAR (PUT)
+# Menguji apakah url_gambar dan deskripsi tersimpan ke database MySQL
+PUT http://localhost:8000/api/products/2
+Accept: application/json
+Content-Type: application/json
+
+{
+  "nama_paket": "gaming (20 Mbps)",
+  "kecepatan_mbps": 20,
+  "harga": 750000,
+  "deskripsi": "Paket internet gaming super stabil low latency.",
+  "url_gambar": "https://images.pexels.com/photos/7915575/pexels-photo-7915575.jpeg?auto=compress&cs=tinysrgb&w=600"
+}
+
+###
+
+### 3. TES GANTI KATA SANDI USER (POST)
+# Menguji kecocokan password lama dan enkripsi password baru
+POST http://localhost:8000/api/customer/change-password
+Accept: application/json
+Content-Type: application/json
+
+{
+  "user_id": 3,
+  "password_lama": "Hamzah321",
+  "password_baru": "Hamzah123"
+}
+
+###
+
+### 4. CEK PROFIL CUSTOMER (GET)
+GET http://localhost:8000/api/customer/profile/3
+Accept: application/json
+
+###
+
+### 5. CEK DAFTAR PELANGGAN ADMIN (GET)
+GET http://localhost:8000/api/customers
+Accept: application/json
+
+### 6. TES LOGIN PENGGUNA (POST)
+# Menguji apakah autentikasi berhasil dan mengembalikan token serta role
+POST http://localhost:8000/api/login
+Accept: application/json
+Content-Type: application/json
+
+{
+  "email": "Hamzahgtg@gmail.com",
+  "password": "Hamzah123"
+}
+
+###
+
+### 7. TES REGISTRASI PELANGGAN BARU (POST)
+# Menguji pembuatan akun user sekaligus otomatis masuk ke tabel customers
+POST http://localhost:8000/api/register
+Accept: application/json
+Content-Type: application/json
+
+{
+  "name": "Rian Pratama",
+  "email": "rian.pratama@gmail.com",
+  "password": "password123",
+  "phone": "081298765432",
+  "address": "Jl. Danau Sentarum No. 12, Pontianak",
+  "product_id": 2
+}
+
+###
+
+### 8. CEK STATISTIK DASHBOARD ADMIN (GET)
+# Menguji data ringkasan pelanggan aktif, total pendapatan, dan grafik
+GET http://localhost:8000/api/dashboard
+Accept: application/json
+
+###
+
+### 9. CEK MUTASI TRANSAKSI ADMIN (GET)
+# Menguji apakah semua riwayat pembayaran tagihan masuk ke mutasi
+GET http://localhost:8000/api/mutasi
+Accept: application/json
+
+###
+
+### 10. CEK RIWAYAT MUTASI / TAGIHAN MILIK CUSTOMER (GET)
+# Menguji tagihan khusus untuk customer ID 3 (Hamzah)
+GET http://localhost:8000/api/customer/mutasi/3
+Accept: application/json
+
+###
+
+### 11. CEK NOTIFIKASI ADMIN (GET)
+# Menguji notifikasi saat ada pendaftaran customer baru atau pembayaran
+GET http://localhost:8000/api/admin/notifications
+Accept: application/json
+
+###
+
+### 12. CEK NOTIFIKASI CUSTOMER (GET)
+# Menguji notifikasi tagihan atau status aktif untuk customer ID 3
+GET http://localhost:8000/api/customer/notifications/3
+Accept: application/json
+
+### 13. TRANSAKSI BARU: BUAT TAGIHAN / BELI VIA QRIS (POST)
+# Menguji tombol "Beli QRIS" di kartu paket internet
+POST http://localhost:8000/api/invoices
+Accept: application/json
+Content-Type: application/json
+
+{
+  "customer_id": 3,
+  "product_id": 2,
+  "total_tagihan": 750000,
+  "nama_produk": "gaming (20 Mbps)",
+  "metode_pembayaran": "QRIS"
+}
+
+###
+
+### 14. CEK STATUS PEMBAYARAN QRIS / INVOICE (POST)
+# Menguji halaman Pindai QRIS (apakah status tagihan sudah PAID / PENDING)
+POST http://localhost:8000/api/invoices/check-status
+Accept: application/json
+Content-Type: application/json
+
+{
+  "invoice_id": 1
+}
+
+###
+
+### 15. ADMIN: TAMBAH PELANGGAN BARU SECARA MANUAL (POST)
+# Menguji modal "Tambah Pelanggan" di menu Kelola Pelanggan Admin
+POST http://localhost:8000/api/customers
+Accept: application/json
+Content-Type: application/json
+
+{
+  "nama": "Doni Pratama",
+  "no_wa": "085211223344",
+  "product_id": 1,
+  "status": "ACTIVE"
+}
+
+###
+
+### 16. ADMIN: EDIT DATA PELANGGAN (PUT)
+# Menguji tombol Edit data pelanggan (misal: ubah nomor HP atau status ke ISOLIR/SUSPEND)
+PUT http://localhost:8000/api/customers/1
+Accept: application/json
+Content-Type: application/json
+
+{
+  "nama": "Budi Santoso",
+  "no_wa": "081234567890",
+  "product_id": 2,
+  "status": "ACTIVE"
+}
+
+###
+
+### 17. ADMIN: TAMBAH PAKET INTERNET BARU (POST)
+# Menguji tombol Floating Action Button "Tambah Paket" di Katalog
+POST http://localhost:8000/api/products
+Accept: application/json
+Content-Type: application/json
+
+{
+  "nama_paket": "Paket WFH Hemat",
+  "kecepatan_mbps": 15,
+  "harga": 185000,
+  "deskripsi": "Paket hemat untuk meeting daring dan kerja dari rumah.",
+  "url_gambar": "https://images.pexels.com/photos/4009402/pexels-photo-4009402.jpeg?auto=compress&cs=tinysrgb&w=600"
+}
+
+###
+
+### 18. TANDAI NOTIFIKASI SUDAH DIBACA (POST)
+# Menguji saat pengguna membuka/membersihkan lonceng notifikasi
+POST http://localhost:8000/api/notifications/mark-read
+Accept: application/json
+Content-Type: application/json
+
+{
+  "user_id": 3,
+  "is_admin": false
+}
