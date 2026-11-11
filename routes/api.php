@@ -179,7 +179,7 @@ $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
 
         return Customer::first();
     } catch (\Throwable $e) {
-        return Customer::find(3) ?? Customer::first();
+        return Customer::first();
     }
 };
 
@@ -277,7 +277,28 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
         $customer = $resolveCustomer();
     }
     if (!$customer) {
-        return response()->json(['success' => false, 'message' => 'Data customer tidak ditemukan.'], 404);
+        return response()->json([
+            'success' => true,
+            'data'    => [
+                'id'                 => '1',
+                'user_id'            => '1',
+                'nama'               => 'Pelanggan Baru',
+                'name'               => 'Pelanggan Baru',
+                'email'              => '-',
+                'no_hp'              => '-',
+                'username_pppoe'     => '-',
+                'nama_paket'         => 'Belum Ada Paket Aktif',
+                'nama_paket_tagihan' => null,
+                'status'             => 'BELUM_AKTIF',
+                'status_koneksi'     => 'Offline',
+                'is_online'          => false,
+                'tagihan'            => 0.0,
+                'nomor_invoice'      => null,
+                'tanggal_beli'       => now()->format('d M Y'),
+                'jatuh_tempo'        => now()->addMonth()->format('d M Y'),
+                'tenggat_waktu'      => 'Belum Ada Langganan',
+            ]
+        ], 200);
     }
 
     $targetId = $customer->id;
@@ -294,14 +315,12 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
         ->latest('id')
         ->first();
 
-    // 3. Cek apakah paket langganan lama masih aktif (belum lewat masa berlaku)
+    // 3. Cek apakah paket langganan lama masih aktif
     $tglBeliCarbon = $lastPaid ? Carbon::parse($lastPaid->tanggal_bayar ?? $lastPaid->updated_at) : null;
     $tglJatuhTempoCarbon = $tglBeliCarbon ? $tglBeliCarbon->copy()->addMonth() : null;
     $masihMasaAktif = $tglJatuhTempoCarbon ? now()->lte($tglJatuhTempoCarbon) : false;
 
-    // 4. LOGIKA NAMA PAKET & KONEKSI SESUAI ALGORITMA:
-    // Kartu Paket Langganan HANYA berganti ke nama paket baru jika SUDAH LUNAS.
-    // Selama belum lunas, kartu paket tetap menampilkan paket lama yang sedang aktif.
+    // 4. Logika nama paket & koneksi
     if ($lastPaid && !empty($lastPaid->nama_produk)) {
         $namaPaketAktif = $lastPaid->nama_produk;
     } else {
@@ -311,18 +330,15 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
     $namaPaketBersih = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $namaPaketAktif);
 
     if ($invPending) {
-        // ADA TAGIHAN BARU YANG BELUM DIBAYAR:
         $tagihanRiil = (double) $invPending->total_tagihan;
         $namaPaketPending = preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($invPending->nama_produk ?? 'Paket Baru'));
 
-        // Jika paket lama masih jalan -> Tetap Online! Jika tidak ada paket lama -> Offline.
         $statusLangganan = $masihMasaAktif ? 'AKTIF' : 'ISOLIR';
         $statusKoneksi   = $masihMasaAktif ? 'Online' : 'Offline';
         $isOnline        = $masihMasaAktif;
         $nomorInvoice    = $invPending->nomor_invoice;
         $tenggatWaktu    = "Menunggu Pembayaran Paket: {$namaPaketPending}";
     } elseif ($lastPaid) {
-        // SEMUA TAGIHAN SUDAH LUNAS:
         $tagihanRiil = 0.0;
         $statusLangganan = 'AKTIF';
         $statusKoneksi = 'Online';
@@ -331,7 +347,6 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
         $tglJatuhTempo = $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : now()->addMonth()->format('d M Y');
         $tenggatWaktu = "LUNAS • Aktif s.d. {$tglJatuhTempo}";
     } else {
-        // BELUM PERNAH BERLANGGANAN:
         $tagihanRiil = 0.0;
         $statusLangganan = 'BELUM_AKTIF';
         $statusKoneksi = 'Offline';
@@ -346,23 +361,23 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
     return response()->json([
         'success' => true,
         'data' => [
-            'id'               => (string) $customer->id,
-            'user_id'          => (string) ($customer->user_id ?? $customer->id),
-            'nama'             => $customer->nama ?? $customer->name ?? 'Pelanggan',
-            'name'             => $customer->nama ?? $customer->name ?? 'Pelanggan',
-            'email'            => $customer->email ?? '-',
-            'no_hp'            => $customer->no_wa ?? $customer->no_hp ?? '-',
-            'username_pppoe'   => $customer->pppoe_username ?? '-',
-            'nama_paket'       => $namaPaketBersih, // Tetap paket lama yang sedang aktif!
-            'nama_paket_tagihan' => $invPending ? preg_replace('/^Pembayaran\s+Paket\s+/i', '', $invPending->nama_produk) : null, // Paket yang sedang ditagihkan (Gaming)
-            'status'           => $statusLangganan,
-            'status_koneksi'   => $statusKoneksi,   // Online karena paket lama belum habis
-            'is_online'        => $isOnline,
-            'tagihan'          => $tagihanRiil,     // Rp 750.000 tagihan baru
-            'nomor_invoice'    => $nomorInvoice,
-            'tanggal_beli'     => $tglBeli,
-            'jatuh_tempo'      => $tglJatuhTempoStr,
-            'tenggat_waktu'    => $tenggatWaktu,
+            'id'                 => (string) $customer->id,
+            'user_id'            => (string) ($customer->user_id ?? $customer->id),
+            'nama'               => $customer->nama ?? $customer->name ?? 'Pelanggan',
+            'name'               => $customer->nama ?? $customer->name ?? 'Pelanggan',
+            'email'              => $customer->email ?? '-',
+            'no_hp'              => $customer->no_wa ?? $customer->no_hp ?? '-',
+            'username_pppoe'     => $customer->pppoe_username ?? '-',
+            'nama_paket'         => $namaPaketBersih,
+            'nama_paket_tagihan' => $invPending ? preg_replace('/^Pembayaran\s+Paket\s+/i', '', $invPending->nama_produk) : null,
+            'status'             => $statusLangganan,
+            'status_koneksi'     => $statusKoneksi,
+            'is_online'          => $isOnline,
+            'tagihan'            => $tagihanRiil,
+            'nomor_invoice'      => $nomorInvoice,
+            'tanggal_beli'       => $tglBeli,
+            'jatuh_tempo'        => $tglJatuhTempoStr,
+            'tenggat_waktu'      => $tenggatWaktu,
         ]
     ], 200);
 };
@@ -568,11 +583,11 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
         }
 
         $customer = $resolveCustomer($identifier);
-        $targetId = $customer ? $customer->id : 3;
+        $targetId = $customer ? $customer->id : null;
 
-        $invoices = Invoice::where('customer_id', $targetId)
-            ->orderByDesc('id')
-            ->get();
+        $invoices = $targetId 
+            ? Invoice::where('customer_id', $targetId)->orderByDesc('id')->get()
+            : collect([]);
 
         $list = [];
         $totalPengeluaranLunas = 0.0;
@@ -730,7 +745,20 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
         }
 
         $customer = $resolveCustomer($identifier);
-        $targetId = $customer ? $customer->id : 3;
+        $targetId = $customer ? $customer->id : null;
+
+        if (!$targetId) {
+            return response()->json([
+                'success'       => true,
+                'peran'         => 'customer',
+                'role'          => 'customer',
+                'unread_count'  => 0,
+                'unreadCount'   => 0,
+                'total'         => 0,
+                'data'          => [],
+                'notifications' => [],
+            ], 200);
+        }
 
         $userKey = 'customer_notif_' . $targetId;
         $notifState = $getNotifState($userKey);
@@ -887,13 +915,15 @@ $handlerMarkAllReadCustomer = function (Request $r) use ($saveNotifState, $resol
         return $handlerMarkAllReadAdmin();
     }
     $customer = $resolveCustomer($r);
-    $targetId = $customer ? $customer->id : 3;
-    $maxCustInv = (int) (Invoice::where('customer_id', $targetId)->max('id') ?? 0);
+    $targetId = $customer ? $customer->id : null;
+    $maxCustInv = $targetId ? (int) (Invoice::where('customer_id', $targetId)->max('id') ?? 0) : 0;
 
-    $saveNotifState('customer_notif_' . $targetId, [
-        'all_read_at'          => Carbon::now()->toIso8601String(),
-        'last_read_invoice_id' => $maxCustInv,
-    ]);
+    if ($targetId) {
+        $saveNotifState('customer_notif_' . $targetId, [
+            'all_read_at'          => Carbon::now()->toIso8601String(),
+            'last_read_invoice_id' => $maxCustInv,
+        ]);
+    }
     return response()->json(['success' => true, 'unread_count' => 0, 'unreadCount' => 0, 'message' => 'Semua notifikasi pelanggan telah ditandai dibaca.']);
 };
 
@@ -987,13 +1017,11 @@ Route::get('/customer/invoice/active', function (Request $request) use ($resolve
 // =========================================================================
 $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer) {
     try {
-        // 1. Ambil data Customer dari Database
         $customer = $resolveCustomer($request);
         if (!$customer) {
             return response()->json(['success' => false, 'message' => 'Data customer tidak ditemukan di database.'], 404);
         }
 
-        // 2. Ambil data Paket/Produk dari Database
         $productId = $request->input('product_id');
         $namaProdukInput = trim($request->input('nama_produk') ?? '');
 
@@ -1004,11 +1032,9 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
             $product = Product::where('nama_paket', $namaProdukInput)->first();
         }
 
-        // Nominal & Nama Paket dari Database
         $nominal = $product ? (int) $product->harga : (int) $request->input('nominal', 0);
         $namaPaket = $product ? $product->nama_paket : (!empty($namaProdukInput) ? $namaProdukInput : 'Paket Internet');
 
-        // Batas minimal transaksi Xendit (wajib minimal Rp 10.000)
         if ($nominal < 10000) {
             return response()->json([
                 'success' => false,
@@ -1018,7 +1044,6 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
 
         $nomorInvoice = 'INV-' . date('YmdHis') . '-' . $customer->id;
 
-        // 3. Format nomor HP dan email customer
         $rawPhone = preg_replace('/[^0-9]/', '', (string)($customer->no_wa ?? $customer->no_hp ?? ''));
         if (str_starts_with($rawPhone, '0')) {
             $phone = '+62' . substr($rawPhone, 1);
@@ -1032,15 +1057,13 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
             ? $customer->email
             : 'pelanggan.' . $customer->id . '@gmail.com';
 
-        // 4. Hubungi API Resmi Xendit V2 Invoices
-        // GANTI MENJADI INI:
-$secretKey = 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa';
+        $secretKey = env('XENDIT_SECRET_KEY', 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa');
 
         $payloadXendit = [
             'external_id'      => $nomorInvoice,
             'amount'           => $nominal,
             'description'      => 'Pembayaran Internet: ' . $namaPaket . ' - ' . ($customer->nama ?? 'Pelanggan'),
-            'invoice_duration' => 86400, // 24 Jam
+            'invoice_duration' => 86400,
             'currency'         => 'IDR',
             'payer_email'      => $custEmail,
             'customer'         => [
@@ -1063,14 +1086,12 @@ $secretKey = 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ
         }
 
         $resData = $response->json();
-        $invoiceUrl = $resData['invoice_url']; // Link checkout resmi Xendit
+        $invoiceUrl = $resData['invoice_url'];
 
-        // 5. Bersihkan invoice pending lama milik pelanggan
         Invoice::where('customer_id', $customer->id)
             ->whereIn('status', ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
             ->delete();
 
-        // 6. Simpan tagihan baru ke database lokal
         $invoice = Invoice::create([
             'nomor_invoice'     => $nomorInvoice,
             'customer_id'       => $customer->id,
@@ -1078,7 +1099,7 @@ $secretKey = 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ
             'status'            => 'PENDING',
             'nama_produk'       => $namaPaket,
             'metode_pembayaran' => 'Xendit Multi Payment',
-            'qr_image_url'      => $invoiceUrl, // Simpan link resmi Xendit
+            'qr_image_url'      => $invoiceUrl,
             'qr_string'         => $invoiceUrl,
         ]);
 
@@ -1088,7 +1109,7 @@ $secretKey = 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ
             'nomor_invoice' => $invoice->nomor_invoice,
             'total_tagihan' => (double) $invoice->total_tagihan,
             'nama_produk'   => $namaPaket,
-            'invoice_url'   => $invoiceUrl, // Link resmi yang dibuka oleh Flutter / Browser
+            'invoice_url'   => $invoiceUrl,
             'qr_image_url'  => $invoiceUrl,
             'qr_string'     => $invoiceUrl,
         ], 200);
@@ -1109,7 +1130,6 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
         $nomorInvoice = trim($request->input('nomor_invoice', ''));
         $simulasi = $request->boolean('simulasi', false);
 
-        // 1. Cari invoice di database lokal
         $invoice = null;
         if (!empty($nomorInvoice)) {
             $invoice = Invoice::where('nomor_invoice', $nomorInvoice)->first();
@@ -1131,15 +1151,13 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
             ], 404);
         }
 
-        $secretKey = 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa';
+        $secretKey = env('XENDIT_SECRET_KEY', 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa');
         $isPaid = false;
 
-        // 2. CEK DATABASE DULU: Jika webhook Xendit sudah mengubahnya jadi PAID
         if (in_array(strtoupper($invoice->status), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS'])) {
             $isPaid = true;
         }
 
-        // 3. JIKA BELUM, TANYA LANGSUNG KE SERVER XENDIT
         if (!$isPaid && !empty($secretKey)) {
             try {
                 $response = Http::withBasicAuth($secretKey, '')
@@ -1149,8 +1167,6 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
 
                 if ($response->successful()) {
                     $res = $response->json();
-                    
-                    // Xendit bisa mengembalikan array [ { status: 'PAID' } ] atau object { status: 'PAID' }
                     $statusXendit = '';
                     if (isset($res[0]['status'])) {
                         $statusXendit = strtoupper($res[0]['status']);
@@ -1167,12 +1183,10 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
             }
         }
 
-        // Jika tombol simulasi ditekan
         if ($simulasi) {
             $isPaid = true;
         }
 
-        // 4. JIKA TERKONFIRMASI LUNAS: Update status pelanggan jadi AKTIF & ONLINE
         if ($isPaid) {
             $invoice->update([
                 'status'        => 'PAID',
@@ -1241,7 +1255,6 @@ Route::post('/xendit/callback', function (Request $request) use ($resolveCustome
 
         $invoice = Invoice::where('nomor_invoice', $nomorInvoice)->first();
 
-        // BAGIAN INI YANG DIUBAH AGAR TOMBOL "TEST AND SAVE" DI XENDIT LANGSUNG SUKSES (200 OK)
         if (!$invoice) {
             return response()->json([
                 'success' => true,
@@ -1280,18 +1293,18 @@ Route::post('/invoices/cancel', function (Request $request) use ($resolveCustome
         $customer = $resolveCustomer($request);
         $nomorInvoice = trim($request->input('nomor_invoice', ''));
 
-        // 1. Batalkan berdasarkan nomor invoice jika ada
         if (!empty($nomorInvoice)) {
             Invoice::where('nomor_invoice', $nomorInvoice)
                 ->whereIn(DB::raw('UPPER(status)'), ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
                 ->update(['status' => 'CANCELLED']);
         }
 
-        // 2. BATALKAN SEMUA tagihan pending milik customer ini (termasuk ID 67!)
-        $targetCustomerId = $customer ? $customer->id : ($request->input('customer_id') ?? 3);
-        Invoice::where('customer_id', $targetCustomerId)
-            ->whereIn(DB::raw('UPPER(status)'), ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
-            ->update(['status' => 'CANCELLED']);
+        $targetCustomerId = $customer ? $customer->id : ($request->input('customer_id') ?? null);
+        if ($targetCustomerId) {
+            Invoice::where('customer_id', $targetCustomerId)
+                ->whereIn(DB::raw('UPPER(status)'), ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
+                ->update(['status' => 'CANCELLED']);
+        }
 
         return response()->json([
             'success' => true,
@@ -1301,8 +1314,9 @@ Route::post('/invoices/cancel', function (Request $request) use ($resolveCustome
         return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
     }
 });
+
 // =========================================================================
-// AUTENTIKASI LOGIN
+// AUTENTIKASI: LOGIN
 // =========================================================================
 Route::post('/login', function (Request $request) {
     try {
@@ -1334,7 +1348,7 @@ Route::post('/login', function (Request $request) {
         }
 
         if (!$customer && in_array(strtolower($user->role ?? ''), ['customer', 'pelanggan'])) {
-            $customer = Customer::find(3) ?? Customer::first();
+            $customer = Customer::first();
         }
 
         $token = null;
@@ -1357,6 +1371,7 @@ Route::post('/login', function (Request $request) {
                 'customer_id' => $customer ? $customer->id : $user->id,
                 'name'        => $user->name,
                 'email'       => $user->email,
+                'phone'       => $customer->no_wa ?? $customer->no_hp ?? '',
                 'role'        => $user->role ?? 'customer',
             ],
         ], 200);
@@ -1371,5 +1386,105 @@ Route::post('/login', function (Request $request) {
             'success' => false,
             'message' => 'Terjadi kesalahan sistem: ' . $e->getMessage()
         ], 500);
+    }
+});
+
+// =========================================================================
+// AUTENTIKASI: REGISTER (CUSTOMER BARU)
+// =========================================================================
+Route::post('/register', function (Request $request) {
+    try {
+        $validated = $request->validate([
+            'name'     => 'required|string|max:255',
+            'email'    => 'required|email|max:255|unique:users,email',
+            'password' => 'required|string|min:6',
+            'phone'    => 'nullable|string',
+        ]);
+
+        $role = strtolower(trim($request->input('role', 'customer')));
+        $noHp = $request->input('phone') ?? $request->input('no_hp') ?? '';
+
+        // 1. Buat data User
+        $user = User::create([
+            'name'     => $validated['name'],
+            'email'    => $validated['email'],
+            'password' => bcrypt($validated['password']),
+            'role'     => $role,
+        ]);
+
+        // 2. Buat profil Customer yang tersambung ke user_id
+        $customerData = [
+            'nama'           => $user->name,
+            'email'          => $user->email,
+            'status'         => 'AKTIF',
+            'status_koneksi' => 'Online',
+            'nama_paket'     => 'Basic Home',
+        ];
+
+        if (Schema::hasColumn('customers', 'user_id')) {
+            $customerData['user_id'] = $user->id;
+        }
+        if (Schema::hasColumn('customers', 'no_wa')) {
+            $customerData['no_wa'] = $noHp;
+        }
+        if (Schema::hasColumn('customers', 'no_hp')) {
+            $customerData['no_hp'] = $noHp;
+        }
+
+        $customer = Customer::create($customerData);
+
+        // 3. Buat Token Autentikasi
+        $token = null;
+        try {
+            if (method_exists($user, 'createToken')) {
+                $token = $user->createToken('auth_token')->plainTextToken;
+            }
+        } catch (\Throwable $tokErr) {}
+
+        if (empty($token)) {
+            $token = Str::random(64);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Pendaftaran akun berhasil!',
+            'token'   => $token,
+            'user'    => [
+                'id'          => $user->id,
+                'customer_id' => $customer->id,
+                'name'        => $user->name,
+                'email'       => $user->email,
+                'phone'       => $noHp,
+                'role'        => $user->role,
+            ],
+        ], 201);
+
+    } catch (\Illuminate\Validation\ValidationException $ve) {
+        return response()->json([
+            'success' => false,
+            'message' => $ve->validator->errors()->first()
+        ], 422);
+    } catch (\Throwable $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Pendaftaran gagal: ' . $e->getMessage()
+        ], 500);
+    }
+});
+
+// =========================================================================
+// AUTENTIKASI: LOGOUT
+// =========================================================================
+Route::post('/logout', function (Request $request) {
+    try {
+        if (Auth::check()) {
+            $user = Auth::user();
+            if (method_exists($user, 'tokens')) {
+                $user->tokens()->delete();
+            }
+        }
+        return response()->json(['success' => true, 'message' => 'Berhasil logout'], 200);
+    } catch (\Throwable $e) {
+        return response()->json(['success' => true, 'message' => 'Berhasil logout'], 200);
     }
 });
