@@ -73,6 +73,7 @@ $checkIsAdmin = function (Request $request = null, $identifier = null) use ($res
             $idVal = $identifier 
                 ?? $request->query('user_id') 
                 ?? $request->input('user_id')
+                ?? $request->header('X-User-Id')
                 ?? $request->query('email') 
                 ?? $request->input('email');
         } else {
@@ -102,6 +103,8 @@ $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
             $req = $identifier;
             $identifier = $req->query('customer_id') 
                 ?? $req->input('customer_id') 
+                ?? $req->header('X-Customer-Id')
+                ?? $req->header('X-User-Id')
                 ?? $req->query('user_id') 
                 ?? $req->input('user_id') 
                 ?? $req->query('id') 
@@ -221,7 +224,7 @@ $getNotifState = function ($userKey) {
         $data['read_ids'] = array_unique(array_merge($data['read_ids'], $cacheIds));
     }
 
-    return $data;
+    return data_get($data, null, $data);
 };
 
 $saveNotifState = function ($userKey, array $update) {
@@ -294,8 +297,8 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
                 'is_online'          => false,
                 'tagihan'            => 0.0,
                 'nomor_invoice'      => null,
-                'tanggal_beli'       => now()->format('d M Y'),
-                'jatuh_tempo'        => now()->addMonth()->format('d M Y'),
+                'tanggal_beli'       => '-',
+                'jatuh_tempo'        => '-',
                 'tenggat_waktu'      => 'Belum Ada Langganan',
             ]
         ], 200);
@@ -315,12 +318,12 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
         ->latest('id')
         ->first();
 
-    // 3. Cek apakah paket langganan lama masih aktif
+    // 3. Cek masa aktif jika pernah membayar
     $tglBeliCarbon = $lastPaid ? Carbon::parse($lastPaid->tanggal_bayar ?? $lastPaid->updated_at) : null;
     $tglJatuhTempoCarbon = $tglBeliCarbon ? $tglBeliCarbon->copy()->addMonth() : null;
     $masihMasaAktif = $tglJatuhTempoCarbon ? now()->lte($tglJatuhTempoCarbon) : false;
 
-    // 4. Logika nama paket & koneksi
+    // 4. Nama paket aktif
     if ($lastPaid && !empty($lastPaid->nama_produk)) {
         $namaPaketAktif = $lastPaid->nama_produk;
     } else {
@@ -333,30 +336,34 @@ $formatCustomerProfile = function ($customer) use ($resolveCustomer) {
         $tagihanRiil = (double) $invPending->total_tagihan;
         $namaPaketPending = preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($invPending->nama_produk ?? 'Paket Baru'));
 
-        $statusLangganan = $masihMasaAktif ? 'AKTIF' : 'ISOLIR';
+        $statusLangganan = $masihMasaAktif ? 'AKTIF' : 'BELUM_AKTIF';
         $statusKoneksi   = $masihMasaAktif ? 'Online' : 'Offline';
         $isOnline        = $masihMasaAktif;
         $nomorInvoice    = $invPending->nomor_invoice;
-        $tenggatWaktu    = "Menunggu Pembayaran Paket: {$namaPaketPending}";
+        $tenggatWaktu    = "Menunggu Pembayaran: {$namaPaketPending}";
+
+        $tglBeli = $lastPaid ? $tglBeliCarbon->format('d M Y') : '-';
+        $tglJatuhTempoStr = $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : '-';
     } elseif ($lastPaid) {
         $tagihanRiil = 0.0;
-        $statusLangganan = 'AKTIF';
-        $statusKoneksi = 'Online';
-        $isOnline = true;
-        $nomorInvoice = null;
-        $tglJatuhTempo = $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : now()->addMonth()->format('d M Y');
-        $tenggatWaktu = "LUNAS • Aktif s.d. {$tglJatuhTempo}";
+        $statusLangganan = $masihMasaAktif ? 'AKTIF' : 'ISOLIR';
+        $statusKoneksi   = $masihMasaAktif ? 'Online' : 'Offline';
+        $isOnline        = $masihMasaAktif;
+        $nomorInvoice    = null;
+        $tglBeli         = $tglBeliCarbon->format('d M Y');
+        $tglJatuhTempoStr= $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : '-';
+        $tenggatWaktu    = $masihMasaAktif ? "LUNAS • Aktif s.d. {$tglJatuhTempoStr}" : "MASA AKTIF HABIS (Isolir)";
     } else {
-        $tagihanRiil = 0.0;
+        // BELUM PERNAH BERLANGGANAN SAMA SEKALI
+        $tagihanRiil     = 0.0;
         $statusLangganan = 'BELUM_AKTIF';
-        $statusKoneksi = 'Offline';
-        $isOnline = false;
-        $nomorInvoice = null;
-        $tenggatWaktu = "Belum Ada Langganan";
+        $statusKoneksi   = 'Offline';
+        $isOnline        = false;
+        $nomorInvoice    = null;
+        $tglBeli         = '-';
+        $tglJatuhTempoStr= '-';
+        $tenggatWaktu    = 'Belum Ada Langganan';
     }
-
-    $tglBeli = ($lastPaid ? Carbon::parse($lastPaid->tanggal_bayar ?? $lastPaid->updated_at) : ($customer->created_at ?? now()))->format('d M Y');
-    $tglJatuhTempoStr = $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : now()->addMonth()->format('d M Y');
 
     return response()->json([
         'success' => true,
@@ -571,6 +578,8 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
         $identifier = $idParam 
             ?? $request->query('customer_id') 
             ?? $request->query('user_id') 
+            ?? $request->header('X-Customer-Id')
+            ?? $request->header('X-User-Id')
             ?? $request->query('id') 
             ?? $request->query('email')
             ?? $request->input('customer_id')
@@ -733,6 +742,8 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
 
         $identifier = $request->query('customer_id') 
             ?? $request->query('user_id') 
+            ?? $request->header('X-Customer-Id')
+            ?? $request->header('X-User-Id')
             ?? $request->query('id') 
             ?? $request->query('email')
             ?? $request->input('customer_id')
@@ -1413,12 +1424,13 @@ Route::post('/register', function (Request $request) {
         ]);
 
         // 2. Buat profil Customer yang tersambung ke user_id
+           // 2. Buat profil Customer yang tersambung ke user_id
         $customerData = [
             'nama'           => $user->name,
             'email'          => $user->email,
-            'status'         => 'AKTIF',
-            'status_koneksi' => 'Online',
-            'nama_paket'     => 'Basic Home',
+            'status'         => 'BELUM_AKTIF',
+            'status_koneksi' => 'Offline',
+            'nama_paket'     => null,
         ];
 
         if (Schema::hasColumn('customers', 'user_id')) {
