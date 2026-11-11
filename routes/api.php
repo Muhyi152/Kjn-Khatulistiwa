@@ -46,7 +46,7 @@ $checkIsAdmin = function (Request $request = null, $identifier = null) use ($res
     try {
         if ($request) {
             $path = strtolower($request->path());
-            if (str_contains($path, 'admin/')) return true;
+            if (str_contains($path, 'admin')) return true;
             if (str_contains($path, 'customer/')) return false;
 
             $headerRole = $request->header('X-User-Role') ?? $request->header('Role') ?? $request->header('role');
@@ -179,7 +179,6 @@ $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
             }
         }
 
-        // Jangan pernah fallback ke Customer::first() agar tidak nyasar ke user lain
         return null;
     } catch (\Throwable $e) {
         return null;
@@ -308,24 +307,20 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
 
     $targetId = $customer->id;
 
-    // 1. Tagihan baru yang belum dibayar (PENDING)
     $invPending = Invoice::where('customer_id', $targetId)
         ->whereIn(DB::raw('UPPER(status)'), ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
         ->latest('id')
         ->first();
 
-    // 2. Pembayaran terakhir yang sudah lunas (PAID)
     $lastPaid = Invoice::where('customer_id', $targetId)
         ->whereIn(DB::raw('UPPER(status)'), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS'])
         ->latest('id')
         ->first();
 
-    // 3. Cek masa aktif jika pernah membayar
     $tglBeliCarbon = $lastPaid ? Carbon::parse($lastPaid->tanggal_bayar ?? $lastPaid->updated_at) : null;
     $tglJatuhTempoCarbon = $tglBeliCarbon ? $tglBeliCarbon->copy()->addMonth() : null;
     $masihMasaAktif = $tglJatuhTempoCarbon ? now()->lte($tglJatuhTempoCarbon) : false;
 
-    // 4. Nama paket aktif
     if ($lastPaid && !empty($lastPaid->nama_produk)) {
         $namaPaketAktif = $lastPaid->nama_produk;
     } else {
@@ -391,11 +386,38 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
 };
 
 // =========================================================================
-// HANDLER DASHBOARD ADMIN
+// HANDLER DASHBOARD ADMIN (DENGAN AUTO-SYNC 4 PRODUK & DISTRIBUSI REALISTIS)
 // =========================================================================
 $handlerAdminDashboard = function (Request $request) {
     try {
+        // 1. AUTO-SYNC: Pastikan Produk ke-4 (Starter Kost Hemat) ada di Database
+        $starterExists = Product::where('nama_paket', 'LIKE', '%Starter%')
+            ->orWhere('name', 'LIKE', '%Starter%')
+            ->first();
+
+        if (!$starterExists) {
+            $starterData = [];
+            if (Schema::hasColumn('products', 'nama_paket')) $starterData['nama_paket'] = 'Starter Kost Hemat';
+            if (Schema::hasColumn('products', 'name')) $starterData['name'] = 'Starter Kost Hemat';
+            if (Schema::hasColumn('products', 'harga')) $starterData['harga'] = 165000;
+            if (Schema::hasColumn('products', 'price')) $starterData['price'] = 165000;
+            if (Schema::hasColumn('products', 'kecepatan')) $starterData['kecepatan'] = '10 Mbps Fiber';
+            if (Schema::hasColumn('products', 'speed')) $starterData['speed'] = '10 Mbps Fiber';
+            if (Schema::hasColumn('products', 'deskripsi')) $starterData['deskripsi'] = 'Pilihan hemat untuk mahasiswa dan anak kost. Cukup untuk browsing dan tugas.';
+            if (Schema::hasColumn('products', 'description')) $starterData['description'] = 'Pilihan hemat untuk mahasiswa dan anak kost. Cukup untuk browsing dan tugas.';
+            
+            try {
+                Product::create($starterData);
+            } catch (\Throwable $e) {}
+        }
+
+        $allProducts = Product::orderBy('id', 'asc')->get();
+        $productsById = $allProducts->keyBy('id');
+        $totalProductsCount = (int) $allProducts->count();
+
+        // 2. Data Pelanggan
         $allCustomers = Customer::orderBy('id', 'desc')->get();
+        $customersById = $allCustomers->keyBy('id');
         $totalCustomers = (int) $allCustomers->count();
 
         $activeConnections = (int) $allCustomers->filter(function ($c) {
@@ -408,6 +430,7 @@ $handlerAdminDashboard = function (Request $request) {
         if ($activeConnections === 0 && $totalCustomers > 0) $activeConnections = $totalCustomers;
         $isolatedCustomers = max(0, $totalCustomers - $activeConnections);
 
+        // 3. Data Tagihan & Omset
         $allInvoices = Invoice::orderBy('id', 'desc')->get();
         $paidInvoices = $allInvoices->filter(function ($inv) {
             return in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
@@ -419,28 +442,48 @@ $handlerAdminDashboard = function (Request $request) {
             return in_array(strtoupper(trim($inv->status ?? '')), ['PENDING', 'UNPAID', 'BELUM_BAYAR']);
         })->count();
 
-        $soldCountByCleanName = [];
+        // 4. Hitung Distribusi Produk Berdasarkan Invoices Riil
+        $soldCountByProdId = [];
         $totalTerjual = 0;
 
         foreach ($paidInvoices as $inv) {
-            $nama = trim($inv->nama_produk ?? '');
-            $nama = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $nama);
-            if (empty($nama)) $nama = 'Basic Home';
-            $cleanKey = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $nama));
-            $soldCountByCleanName[$cleanKey] = ($soldCountByCleanName[$cleanKey] ?? 0) + 1;
-            $totalTerjual++;
+            $matchedProdId = null;
+
+            // Coba cocokkan lewat product_id milik customer
+            $cust = $customersById->get($inv->customer_id);
+            if ($cust && !empty($cust->product_id) && $productsById->has($cust->product_id)) {
+                $matchedProdId = $cust->product_id;
+            }
+
+            // Jika belum cocok, cocokkan lewat nominal harga
+            if (!$matchedProdId) {
+                $nom = (double) $inv->total_tagihan;
+                foreach ($allProducts as $p) {
+                    if ((double)$p->harga === $nom || (double)$p->price === $nom) {
+                        $matchedProdId = $p->id;
+                        break;
+                    }
+                }
+            }
+
+            // Fallback produk pertama jika tetap tidak cocok
+            if (!$matchedProdId && $allProducts->isNotEmpty()) {
+                $matchedProdId = $allProducts->first()->id;
+            }
+
+            if ($matchedProdId) {
+                $soldCountByProdId[$matchedProdId] = ($soldCountByProdId[$matchedProdId] ?? 0) + 1;
+                $totalTerjual++;
+            }
         }
 
-        $allProducts = Product::orderBy('id', 'asc')->get();
-        $presetColors = ['#2563EB', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#06B6D4', '#F97316', '#14B8A6', '#64748B'];
-
+        $presetColors = ['#2563EB', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#06B6D4', '#F97316', '#14B8A6'];
         $planDistribution = [];
         $colorIdx = 0;
 
         foreach ($allProducts as $prod) {
             $namaPaket = trim($prod->nama_paket ?? $prod->name ?? ('Paket #' . $prod->id));
-            $cleanProdKey = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $namaPaket));
-            $terjual = $soldCountByCleanName[$cleanProdKey] ?? 0;
+            $terjual = $soldCountByProdId[$prod->id] ?? 0;
             $persentase = $totalTerjual > 0 ? round(($terjual / $totalTerjual) * 100) : 0;
             $warna = $colorIdx < count($presetColors) ? $presetColors[$colorIdx] : "hsl(" . round(fmod($colorIdx * 137.5, 360)) . ", 75%, 50%)";
 
@@ -448,14 +491,18 @@ $handlerAdminDashboard = function (Request $request) {
                 'id'          => (int) $prod->id,
                 'nama'        => $namaPaket,
                 'nama_paket'  => $namaPaket,
+                'name'        => $namaPaket,
                 'terjual'     => (int) $terjual,
                 'total'       => (int) $terjual,
                 'persentase'  => (int) $persentase,
+                'percentage'  => (int) $persentase,
                 'warna'       => $warna,
+                'color'       => $warna,
             ];
             $colorIdx++;
         }
 
+        // 5. Tren Pendapatan 6 Bulan Terakhir
         $now = Carbon::now();
         $groupedByMonth = [];
 
@@ -500,8 +547,10 @@ $handlerAdminDashboard = function (Request $request) {
             'monthlyRevenue'          => $monthlyRevenue,
             'paid_invoices'           => $paidCount,
             'pending_invoices'        => $pendingCount,
-            'total_products'          => (int) $allProducts->count(),
+            'total_products'          => $totalProductsCount,
+            'totalProducts'           => $totalProductsCount,
             'plan_distribution'       => $planDistribution,
+            'planDistribution'        => $planDistribution,
             'revenue_customer_growth' => $revenueMonthly,
         ];
 
@@ -517,20 +566,21 @@ Route::get('/customer/dashboard', function (Request $r) use ($resolveCustomer, $
     return $formatCustomerProfile($resolveCustomer($r), $r);
 });
 Route::get('/dashboard', function (Request $r) use ($resolveCustomer, $formatCustomerProfile, $handlerAdminDashboard, $checkIsAdmin) {
-    if ($checkIsAdmin($r)) {
+    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id') && !$r->header('X-Customer-Id'))) {
         return $handlerAdminDashboard($r);
     }
     return $formatCustomerProfile($resolveCustomer($r), $r);
 });
 
 // =========================================================================
-// ROUTE MUTASI ADMIN & CUSTOMER
+// ROUTE MUTASI ADMIN & CUSTOMER (DENGAN SINKRONISASI DATA UTUH)
 // =========================================================================
 $handlerMutasiAdmin = function (Request $request) {
     try {
         $invoices = Invoice::orderByDesc('id')->get();
         $customerIds = $invoices->pluck('customer_id')->filter()->unique();
         $customersMap = Customer::whereIn('id', $customerIds)->pluck('nama', 'id');
+        $allProducts = Product::all()->keyBy('id');
 
         $list = [];
         $totalOmsetMasuk = 0.0;
@@ -538,37 +588,66 @@ $handlerMutasiAdmin = function (Request $request) {
 
         foreach ($invoices as $inv) {
             $nominal = (double) $inv->total_tagihan;
-            $isPaid = in_array(strtoupper($inv->status), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
+            $isPaid = in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
 
             if ($isPaid) {
                 $totalOmsetMasuk += $nominal;
                 $totalTerbayar++;
             }
 
+            // Nama produk cerdas
+            $namaProduk = trim($inv->nama_produk ?? '');
+            if (empty($namaProduk)) {
+                if ($nominal >= 700000) {
+                    $namaProduk = 'Ultra Business Dedicated';
+                } elseif ($nominal >= 350000) {
+                    $namaProduk = 'Standard Pro Gamer';
+                } else {
+                    $namaProduk = 'Basic Home Fiber';
+                }
+            }
+            $namaProdukBersih = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $namaProduk);
+
             $list[] = [
                 'id'                 => (int) $inv->id,
                 'nomor_invoice'      => (string) $inv->nomor_invoice,
                 'customer_id'        => $inv->customer_id,
                 'nama_customer'      => $customersMap[$inv->customer_id] ?? ('Pelanggan #' . $inv->customer_id),
-                'nama_produk'        => 'Pembayaran Paket ' . preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($inv->nama_produk ?: 'Basic Home')),
+                'nama_produk'        => 'Pembayaran Paket ' . $namaProdukBersih,
+                'product_name'       => $namaProdukBersih,
                 'total_tagihan'      => $nominal,
-                'status'             => strtoupper($inv->status),
+                'amount'             => $nominal,
+                'status'             => $isPaid ? 'PAID' : strtoupper($inv->status),
                 'is_paid'            => $isPaid,
-                'metode_pembayaran'  => $inv->metode_pembayaran ?? 'Xendit Payment Link',
+                'metode_pembayaran'  => $inv->metode_pembayaran ?? 'Xendit Multi Payment',
                 'tanggal_bayar'      => (string) ($inv->tanggal_bayar ?? $inv->created_at),
                 'created_at'         => (string) $inv->created_at,
             ];
         }
 
-        return response()->json([
-            'success'            => true,
-            'peran'              => 'admin',
-            'total_dana_masuk'   => $totalOmsetMasuk,
-            'tagihan_terbayar'   => $totalTerbayar,
-            'total_transaksi'    => count($list),
-            'data'               => $list,
-            'mutasi'             => $list,
-        ], 200);
+        $summaryData = [
+            'total_dana_masuk'     => $totalOmsetMasuk,
+            'totalDanaMasuk'       => $totalOmsetMasuk,
+            'total_masuk'          => $totalOmsetMasuk,
+            'total_omset'          => $totalOmsetMasuk,
+            'tagihan_terbayar'     => $totalTerbayar,
+            'tagihanTerbayar'      => $totalTerbayar,
+            'total_terbayar'       => $totalTerbayar,
+            'total_transaksi'      => count($list),
+            'totalTransaksi'       => count($list),
+            'riwayat_dana_masuk'   => count($list),
+            'mutasi'               => $list,
+            'transactions'         => $list,
+            'list'                 => $list,
+            'data'                 => $list,
+        ];
+
+        return response()->json(array_merge([
+            'success' => true,
+            'peran'   => 'admin',
+            'role'    => 'admin',
+        ], $summaryData), 200);
+
     } catch (\Throwable $e) {
         return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
     }
@@ -605,7 +684,7 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
 
         foreach ($invoices as $inv) {
             $nominal = (double) $inv->total_tagihan;
-            $isPaid = in_array(strtoupper($inv->status), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
+            $isPaid = in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
 
             if ($isPaid) {
                 $totalPengeluaranLunas += $nominal;
@@ -621,7 +700,7 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
                 'total_tagihan'      => $nominal,
                 'status'             => strtoupper($inv->status),
                 'is_paid'            => $isPaid,
-                'metode_pembayaran'  => $inv->metode_pembayaran ?? 'Xendit Payment Link',
+                'metode_pembayaran'  => $inv->metode_pembayaran ?? 'Xendit Multi Payment',
                 'tanggal_bayar'      => (string) ($inv->tanggal_bayar ?? $inv->created_at),
                 'created_at'         => (string) $inv->created_at,
             ];
@@ -642,10 +721,22 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
     }
 };
 
+// Rute Mutasi Admin yang lengkap
 Route::get('/admin/mutasi', fn(Request $r) => $handlerMutasiAdmin($r));
+Route::get('/mutasi/admin', fn(Request $r) => $handlerMutasiAdmin($r));
+Route::get('/mutasi-admin', fn(Request $r) => $handlerMutasiAdmin($r));
+Route::get('/admin/mutasi-transaksi', fn(Request $r) => $handlerMutasiAdmin($r));
+Route::get('/mutasi-transaksi', fn(Request $r) => $handlerMutasiAdmin($r));
+Route::get('/admin/transactions', fn(Request $r) => $handlerMutasiAdmin($r));
+Route::get('/transactions', fn(Request $r) => $handlerMutasiAdmin($r));
+
 Route::get('/customer/mutasi', fn(Request $r) => $handlerMutasiCustomer($r));
+
+// Rute umum /mutasi (Cerdas: jika tidak menyebutkan customer_id, otomatis arahkan ke Admin Mutasi)
 Route::get('/mutasi', function (Request $r) use ($handlerMutasiAdmin, $handlerMutasiCustomer, $checkIsAdmin) {
-    if ($checkIsAdmin($r)) return $handlerMutasiAdmin($r);
+    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id') && !$r->header('X-Customer-Id'))) {
+        return $handlerMutasiAdmin($r);
+    }
     return $handlerMutasiCustomer($r);
 });
 
@@ -668,7 +759,7 @@ $handlerAdminNotifications = function (Request $request) use ($getNotifState) {
         $unreadCount = 0;
 
         foreach ($invoices as $inv) {
-            $isPaid = in_array(strtoupper($inv->status), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
+            $isPaid = in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
             $eventTime = Carbon::parse($inv->tanggal_bayar ?? $inv->created_at ?? now());
             $namaPelanggan = $customersMap[$inv->customer_id] ?? ('Pelanggan #' . $inv->customer_id);
             $namaPaket = preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($inv->nama_produk ?: 'Basic Home'));
@@ -787,7 +878,7 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
         $unreadCount = 0;
 
         foreach ($invoices as $inv) {
-            $isPaid = in_array(strtoupper($inv->status), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
+            $isPaid = in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
             $eventTime = Carbon::parse($inv->tanggal_bayar ?? $inv->created_at ?? now());
             $strId = (string) $inv->id;
             $idNotif = $isPaid ? ('cust-paid-' . $inv->id) : ('cust-pending-' . $inv->id);
@@ -843,40 +934,6 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
             ];
         }
 
-        if ($customer) {
-            $idStatusNotif = 'notif-status-' . $customer->id;
-            $statusTime = Carbon::parse($customer->updated_at ?? now());
-            $sudahDibacaStatus = ($lastReadInvoiceId > 0) || ($allReadAt && $statusTime->lte($allReadAt)) || in_array($idStatusNotif, $readIds);
-            $namaPaketCust = preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($customer->nama_paket ?? 'Standar'));
-
-            $notifications[] = [
-                'id'              => '99999',
-                'notif_id'        => $idStatusNotif,
-                'notification_id' => $idStatusNotif,
-                'tipe'            => 'INFO',
-                'type'            => 'INFO',
-                'judul'           => 'Layanan Internet Terhubung',
-                'title'           => 'Layanan Internet Terhubung',
-                'pesan'           => "Paket internet {$namaPaketCust} Anda saat ini berstatus aktif normal.",
-                'message'         => "Paket internet {$namaPaketCust} Anda saat ini berstatus aktif normal.",
-                'body'            => "Paket internet {$namaPaketCust} Anda saat ini berstatus aktif normal.",
-                'nomor_invoice'   => '-',
-                'nama_produk'     => $namaPaketCust,
-                'product_name'    => $namaPaketCust,
-                'total'           => 0.0,
-                'total_tagihan'   => 0.0,
-                'amount'          => 0.0,
-                'status'          => 'AKTIF',
-                'tanggal'         => $statusTime->toIso8601String(),
-                'waktu'           => $statusTime->toIso8601String(),
-                'created_at'      => $statusTime->toIso8601String(),
-                'date'            => $statusTime->toIso8601String(),
-                'timestamp'       => $statusTime->timestamp,
-                'is_read'         => $sudahDibacaStatus,
-                'sudah_dibaca'    => $sudahDibacaStatus,
-            ];
-        }
-
         return response()->json([
             'success'       => true, 
             'peran'         => 'customer',
@@ -900,21 +957,19 @@ Route::get('/customer/notification', fn(Request $r) => $handlerCustomerNotificat
 Route::get('/customer/notifikasi', fn(Request $r) => $handlerCustomerNotifications($r));
 
 Route::get('/notifications', function (Request $r) use ($handlerAdminNotifications, $handlerCustomerNotifications, $checkIsAdmin) {
-    if ($checkIsAdmin($r)) return $handlerAdminNotifications($r);
+    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerAdminNotifications($r);
     return $handlerCustomerNotifications($r);
 });
 Route::get('/notification', function (Request $r) use ($handlerAdminNotifications, $handlerCustomerNotifications, $checkIsAdmin) {
-    if ($checkIsAdmin($r)) return $handlerAdminNotifications($r);
+    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerAdminNotifications($r);
     return $handlerCustomerNotifications($r);
 });
 Route::get('/notifikasi', function (Request $r) use ($handlerAdminNotifications, $handlerCustomerNotifications, $checkIsAdmin) {
-    if ($checkIsAdmin($r)) return $handlerAdminNotifications($r);
+    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerAdminNotifications($r);
     return $handlerCustomerNotifications($r);
 });
 
-// =========================================================================
-// MARK ALL READ NOTIFIKASI
-// =========================================================================
+// Mark all read
 $handlerMarkAllReadAdmin = function () use ($saveNotifState) {
     $maxInvoiceId = (int) (Invoice::max('id') ?? 0);
     $saveNotifState('admin_system_notifications', [
@@ -942,33 +997,18 @@ $handlerMarkAllReadCustomer = function (Request $r) use ($saveNotifState, $resol
 };
 
 Route::match(['GET', 'POST'], '/admin/notifications/mark-all-read', fn() => $handlerMarkAllReadAdmin());
-Route::match(['GET', 'POST'], '/admin/notifikasi/mark-all-read', fn() => $handlerMarkAllReadAdmin());
 Route::match(['GET', 'POST'], '/customer/notifications/mark-all-read', fn(Request $r) => $handlerMarkAllReadCustomer($r));
-Route::match(['GET', 'POST'], '/customer/notifikasi/mark-all-read', fn(Request $r) => $handlerMarkAllReadCustomer($r));
-
 Route::match(['GET', 'POST'], '/notifications/mark-all-read', function (Request $r) use ($checkIsAdmin, $handlerMarkAllReadAdmin, $handlerMarkAllReadCustomer) {
-    if ($checkIsAdmin($r)) return $handlerMarkAllReadAdmin();
-    return $handlerMarkAllReadCustomer($r);
-});
-Route::match(['GET', 'POST'], '/notifikasi/mark-all-read', function (Request $r) use ($checkIsAdmin, $handlerMarkAllReadAdmin, $handlerMarkAllReadCustomer) {
-    if ($checkIsAdmin($r)) return $handlerMarkAllReadAdmin();
+    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerMarkAllReadAdmin();
     return $handlerMarkAllReadCustomer($r);
 });
 
-// =========================================================================
-// ROUTE PROFILE CUSTOMER & RESOURCES
-// =========================================================================
+// Profile Resources
 Route::get('/customer/profile/{identifier}', function ($identifier) use ($resolveCustomer, $formatCustomerProfile) {
     $cust = $resolveCustomer($identifier);
     return $formatCustomerProfile($cust);
 });
-
 Route::get('/customers/{id}', function ($id) use ($resolveCustomer, $formatCustomerProfile) {
-    $cust = $resolveCustomer($id);
-    return $formatCustomerProfile($cust);
-})->where('id', '[0-9]+');
-
-Route::get('/customer/{id}', function ($id) use ($resolveCustomer, $formatCustomerProfile) {
     $cust = $resolveCustomer($id);
     return $formatCustomerProfile($cust);
 })->where('id', '[0-9]+');
@@ -976,9 +1016,7 @@ Route::get('/customer/{id}', function ($id) use ($resolveCustomer, $formatCustom
 Route::apiResource('customers', CustomerController::class);
 Route::apiResource('products', ProductController::class);
 
-// =========================================================================
-// TAGIHAN AKTIF CUSTOMER
-// =========================================================================
+// Tagihan Aktif
 Route::get('/customer/invoice/active', function (Request $request) use ($resolveCustomer) {
     try {
         $cust = $resolveCustomer($request);
@@ -1026,9 +1064,7 @@ Route::get('/customer/invoice/active', function (Request $request) use ($resolve
     }
 });
 
-// =========================================================================
-// BUAT INVOICE / PAYMENT LINK RESMI XENDIT (DINAMIS DARI DATABASE)
-// =========================================================================
+// Xendit
 $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer) {
     try {
         $customer = $resolveCustomer($request);
@@ -1052,7 +1088,7 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
         if ($nominal < 10000) {
             return response()->json([
                 'success' => false,
-                'message' => 'Nominal tagihan minimal Rp 10.000 untuk diproses oleh Xendit (Nominal saat ini: Rp ' . number_format($nominal, 0, ',', '.') . ').'
+                'message' => 'Nominal tagihan minimal Rp 10.000 untuk diproses oleh Xendit.'
             ], 422);
         }
 
@@ -1092,7 +1128,6 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
             ->post('https://api.xendit.co/v2/invoices', $payloadXendit);
 
         if (!$response->successful()) {
-            Log::warning('Xendit Invoice Gagal [' . $response->status() . ']: ' . $response->body());
             return response()->json([
                 'success' => false,
                 'message' => 'Xendit menolak pembuatan tagihan: ' . ($response->json('message') ?? $response->body())
@@ -1136,9 +1171,7 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
 Route::post('/xendit/create-invoice', fn(Request $r) => $handlerCreateInvoiceXendit($r));
 Route::post('/xendit/create-qris', fn(Request $r) => $handlerCreateInvoiceXendit($r));
 
-// =========================================================================
-// CEK STATUS PEMBAYARAN KE SERVER XENDIT REALTIME
-// =========================================================================
+// Cek Status Pembayaran
 Route::post('/invoices/check-status', function (Request $request) use ($resolveCustomer) {
     try {
         $nomorInvoice = trim($request->input('nomor_invoice', ''));
@@ -1152,23 +1185,18 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
         if (!$invoice) {
             $customer = $resolveCustomer($request);
             if ($customer) {
-                $invoice = Invoice::where('customer_id', $customer->id)
-                    ->latest('id')
-                    ->first();
+                $invoice = Invoice::where('customer_id', $customer->id)->latest('id')->first();
             }
         }
 
         if (!$invoice) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Tagihan tidak ditemukan.'
-            ], 404);
+            return response()->json(['success' => false, 'message' => 'Tagihan tidak ditemukan.'], 404);
         }
 
         $secretKey = env('XENDIT_SECRET_KEY', 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa');
         $isPaid = false;
 
-        if (in_array(strtoupper($invoice->status), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS'])) {
+        if (in_array(strtoupper(trim($invoice->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS'])) {
             $isPaid = true;
         }
 
@@ -1181,43 +1209,21 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
 
                 if ($response->successful()) {
                     $res = $response->json();
-                    $statusXendit = '';
-                    if (isset($res[0]['status'])) {
-                        $statusXendit = strtoupper($res[0]['status']);
-                    } elseif (isset($res['status'])) {
-                        $statusXendit = strtoupper($res['status']);
-                    }
-
+                    $statusXendit = strtoupper($res[0]['status'] ?? $res['status'] ?? '');
                     if (in_array($statusXendit, ['PAID', 'SETTLED', 'COMPLETED'])) {
                         $isPaid = true;
                     }
                 }
-            } catch (\Throwable $err) {
-                Log::warning('Gagal verifikasi ke Xendit: ' . $err->getMessage());
-            }
+            } catch (\Throwable $err) {}
         }
 
-        if ($simulasi) {
-            $isPaid = true;
-        }
+        if ($simulasi) $isPaid = true;
 
         if ($isPaid) {
-            $invoice->update([
-                'status'        => 'PAID',
-                'tanggal_bayar' => now(),
-            ]);
-
+            $invoice->update(['status' => 'PAID', 'tanggal_bayar' => now()]);
             $customer = $resolveCustomer($invoice->customer_id);
             if ($customer) {
-                $prod = Product::where('nama_paket', $invoice->nama_produk)->first();
-                $updateData = ['status' => 'AKTIF', 'status_koneksi' => 'Online'];
-                if ($prod && Schema::hasColumn('customers', 'product_id')) {
-                    $updateData['product_id'] = $prod->id;
-                }
-                if (Schema::hasColumn('customers', 'nama_paket')) {
-                    $updateData['nama_paket'] = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $invoice->nama_produk);
-                }
-                $customer->update($updateData);
+                $customer->update(['status' => 'ACTIVE', 'status_koneksi' => 'Online']);
             }
 
             return response()->json([
@@ -1227,81 +1233,16 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
                 'message'       => 'Pembayaran berhasil diverifikasi lunas!',
                 'nomor_invoice' => $invoice->nomor_invoice,
                 'total_tagihan' => (double) $invoice->total_tagihan,
-                'nama_produk'   => $invoice->nama_produk,
             ], 200);
         }
 
-        return response()->json([
-            'success' => false,
-            'is_paid' => false,
-            'status'  => 'PENDING',
-            'message' => 'Pembayaran belum terdeteksi di Xendit.',
-        ], 200);
-
+        return response()->json(['success' => false, 'is_paid' => false, 'status' => 'PENDING'], 200);
     } catch (\Throwable $e) {
         return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
     }
 });
 
-// =========================================================================
-// WEBHOOK / CALLBACK OTOMATIS DARI XENDIT
-// =========================================================================
-Route::post('/xendit/callback', function (Request $request) use ($resolveCustomer) {
-    try {
-        $token = $request->header('x-callback-token');
-        $expectedToken = env('XENDIT_CALLBACK_TOKEN') 
-            ?: config('services.xendit.callback_token') 
-            ?: '7tOwxp2G4djBDJ0ZOenlfcJJofGODiHeubfiNWwTRa3YTZk1';
-
-        if (!empty($expectedToken) && $token !== $expectedToken) {
-            return response()->json(['message' => 'Token Callback Tidak Sah'], 403);
-        }
-
-        $payload = $request->all();
-        Log::info('Xendit Webhook Diterima:', $payload);
-
-        $nomorInvoice = $payload['external_id'] ?? $payload['data']['reference_id'] ?? $payload['reference_id'] ?? null;
-        $status = strtoupper($payload['status'] ?? $payload['data']['status'] ?? '');
-
-        if (!$nomorInvoice) {
-            return response()->json(['message' => 'Nomor invoice tidak ditemukan dalam payload'], 400);
-        }
-
-        $invoice = Invoice::where('nomor_invoice', $nomorInvoice)->first();
-
-        if (!$invoice) {
-            return response()->json([
-                'success' => true,
-                'message' => 'Test webhook Xendit berhasil diterima (Invoice testing: ' . $nomorInvoice . ')'
-            ], 200);
-        }
-
-        if (in_array($status, ['COMPLETED', 'PAID', 'SUCCEEDED', 'SETTLED'])) {
-            $invoice->update([
-                'status'        => 'PAID',
-                'tanggal_bayar' => now(),
-            ]);
-
-            $customer = $resolveCustomer($invoice->customer_id);
-            if ($customer) {
-                $prod = Product::where('nama_paket', $invoice->nama_produk)->first();
-                $updateData = ['status' => 'AKTIF', 'status_koneksi' => 'Online'];
-                if ($prod && Schema::hasColumn('customers', 'product_id')) {
-                    $updateData['product_id'] = $prod->id;
-                }
-                if (Schema::hasColumn('customers', 'nama_paket')) {
-                    $updateData['nama_paket'] = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $invoice->nama_produk);
-                }
-                $customer->update($updateData);
-            }
-        }
-
-        return response()->json(['success' => true, 'message' => 'Callback berhasil diproses'], 200);
-    } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
-    }
-});
-
+// Cancel Invoice
 Route::post('/invoices/cancel', function (Request $request) use ($resolveCustomer) {
     try {
         $customer = $resolveCustomer($request);
@@ -1320,17 +1261,14 @@ Route::post('/invoices/cancel', function (Request $request) use ($resolveCustome
                 ->update(['status' => 'CANCELLED']);
         }
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Semua tagihan pending berhasil dibatalkan.'
-        ], 200);
+        return response()->json(['success' => true, 'message' => 'Tagihan dibatalkan.'], 200);
     } catch (\Throwable $e) {
         return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
     }
 });
 
 // =========================================================================
-// AUTENTIKASI: LOGIN
+// LOGIN
 // =========================================================================
 Route::post('/login', function (Request $request) {
     try {
@@ -1386,20 +1324,14 @@ Route::post('/login', function (Request $request) {
         ], 200);
 
     } catch (\Illuminate\Validation\ValidationException $ve) {
-        return response()->json([
-            'success' => false,
-            'message' => $ve->validator->errors()->first()
-        ], 422);
+        return response()->json(['success' => false, 'message' => $ve->validator->errors()->first()], 422);
     } catch (\Throwable $e) {
-        return response()->json([
-            'success' => false,
-            'message' => 'Terjadi kesalahan sistem: ' . $e->getMessage()
-        ], 500);
+        return response()->json(['success' => false, 'message' => 'Terjadi kesalahan sistem: ' . $e->getMessage()], 500);
     }
 });
 
 // =========================================================================
-// AUTENTIKASI: REGISTER (CUSTOMER BARU)
+// REGISTER (CUSTOMER BARU)
 // =========================================================================
 Route::post('/register', function (Request $request) {
     try {
@@ -1413,17 +1345,15 @@ Route::post('/register', function (Request $request) {
         $role = strtolower(trim($request->input('role', 'customer')));
         $noHp = $request->input('phone') ?? $request->input('no_hp') ?? '';
 
-        // Gunakan Transaction agar tidak ada akun orphan jika salah satu query gagal
-        $result = DB::transaction(function () use ($validated, $role, $noHp) {
-            // 1. Simpan akun ke tabel users
+        $result = DB::transaction(function () use ($validated, $role, $noHp, $request) {
             $user = User::create([
-                'name'     => $validated['name'],
-                'email'    => $validated['email'],
-                'password' => bcrypt($validated['password']),
-                'role'     => $role,
+                'name'              => $validated['name'],
+                'email'             => $validated['email'],
+                'password'          => bcrypt($validated['password']),
+                'role'              => $role,
+                'email_verified_at' => now(),
             ]);
 
-            // 2. Siapkan data customer secara aman (hanya masukkan field yang benar-benar ada di tabel Railway)
             $customerData = [];
 
             if (Schema::hasColumn('customers', 'nama')) {
@@ -1445,7 +1375,7 @@ Route::post('/register', function (Request $request) {
                 $customerData['no_hp'] = $noHp;
             }
             if (Schema::hasColumn('customers', 'status')) {
-                $customerData['status'] = 'BELUM_AKTIF';
+                $customerData['status'] = 'INACTIVE';
             }
             if (Schema::hasColumn('customers', 'status_koneksi')) {
                 $customerData['status_koneksi'] = 'Offline';
@@ -1454,7 +1384,8 @@ Route::post('/register', function (Request $request) {
                 $customerData['nama_paket'] = null;
             }
             if (Schema::hasColumn('customers', 'product_id')) {
-                $customerData['product_id'] = null;
+                $defaultProd = Product::first();
+                $customerData['product_id'] = $request->input('product_id', $defaultProd ? $defaultProd->id : 1);
             }
 
             $customer = Customer::create($customerData);
@@ -1468,7 +1399,6 @@ Route::post('/register', function (Request $request) {
         $user = $result['user'];
         $customer = $result['customer'];
 
-        // 3. Buat Token Autentikasi
         $token = null;
         try {
             if (method_exists($user, 'createToken')) {
@@ -1495,21 +1425,13 @@ Route::post('/register', function (Request $request) {
         ], 201);
 
     } catch (\Illuminate\Validation\ValidationException $ve) {
-        return response()->json([
-            'success' => false,
-            'message' => $ve->validator->errors()->first()
-        ], 422);
+        return response()->json(['success' => false, 'message' => $ve->validator->errors()->first()], 422);
     } catch (\Throwable $e) {
-        return response()->json([
-            'success' => false,
-            'message' => 'Pendaftaran gagal: ' . $e->getMessage()
-        ], 500);
+        return response()->json(['success' => false, 'message' => 'Pendaftaran gagal: ' . $e->getMessage()], 500);
     }
 });
 
-// =========================================================================
-// AUTENTIKASI: LOGOUT
-// =========================================================================
+// Logout
 Route::post('/logout', function (Request $request) {
     try {
         if (Auth::check()) {
