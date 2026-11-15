@@ -1182,7 +1182,7 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
             }
         }
 
-        if (!$product && $nominalInput > 0) {
+        if (!$product && empty($namaProdukInput) && $nominalInput > 0) {
             foreach (Product::all() as $p) {
                 if ((int) ($p->harga ?? $p->price ?? 0) === $nominalInput) {
                     $product = $p;
