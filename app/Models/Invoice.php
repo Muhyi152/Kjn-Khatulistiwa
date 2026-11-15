@@ -9,14 +9,17 @@ class Invoice extends Model
 {
     use HasFactory;
 
-    protected $fillable = [
-        'nomor_invoice',
-        'customer_id',
-        'nama_produk', // <-- Sudah tepat di sini
-        'total_tagihan',
-        'status',
-        'tanggal_bayar',
-    ];
+   protected $fillable = [
+    'nomor_invoice',
+    'customer_id',
+    'total_tagihan',
+    'status',
+    'nama_produk',
+    'metode_pembayaran',
+    'qr_image_url',
+    'qr_string',
+    'tanggal_bayar',
+];
 
     // Opsional: Relasi ke tabel Customer
     public function customer()
