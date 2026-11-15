@@ -70,11 +70,11 @@ $checkIsAdmin = function (Request $request = null, $identifier = null) use ($res
                 if (in_array($uRole, ['customer', 'pelanggan', 'user'])) return false;
             }
 
-            $idVal = $identifier 
-                ?? $request->query('user_id') 
+            $idVal = $identifier
+                ?? $request->query('user_id')
                 ?? $request->input('user_id')
                 ?? $request->header('X-User-Id')
-                ?? $request->query('email') 
+                ?? $request->query('email')
                 ?? $request->input('email');
         } else {
             $idVal = $identifier;
@@ -100,31 +100,58 @@ $checkIsAdmin = function (Request $request = null, $identifier = null) use ($res
 $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
     try {
         $reqUser = null;
+        $explicitUserId = null;
+
         if ($identifier instanceof Request) {
             $req = $identifier;
             $reqUser = $resolveCurrentUser($req);
-            $identifier = $req->query('customer_id') 
-                ?? $req->input('customer_id') 
-                ?? $req->header('X-Customer-Id')
-                ?? $req->header('X-User-Id')
-                ?? $req->query('user_id') 
-                ?? $req->input('user_id') 
-                ?? $req->query('id') 
-                ?? $req->input('id') 
-                ?? $req->query('email') 
+
+            $custId = $req->query('customer_id')
+                ?? $req->input('customer_id')
+                ?? $req->header('X-Customer-Id');
+
+            $explicitUserId = $req->query('user_id')
+                ?? $req->input('user_id')
+                ?? $req->header('X-User-Id');
+
+            $identifier = $custId
+                ?? $req->query('id')
+                ?? $req->input('id')
+                ?? $req->query('email')
                 ?? $req->input('email');
-            
-            if (empty($identifier) && $reqUser) {
-                $identifier = $reqUser->id;
+
+            if (empty($identifier) && empty($explicitUserId) && $reqUser) {
+                $explicitUserId = $reqUser->id;
             }
         } elseif (is_array($identifier)) {
-            $identifier = $identifier['customer_id'] ?? $identifier['user_id'] ?? $identifier['id'] ?? $identifier['email'] ?? null;
+            $explicitUserId = $identifier['user_id'] ?? null;
+            $identifier = $identifier['customer_id'] ?? $identifier['id'] ?? $identifier['email'] ?? null;
         }
 
         $hasUserIdCol = Schema::hasColumn('customers', 'user_id');
         $hasEmailCol  = Schema::hasColumn('customers', 'email');
         $hasNamaCol   = Schema::hasColumn('customers', 'nama');
 
+        // 1. Jika user_id diketahui, prioritaskan pencarian via user_id/email/nama User
+        if (!empty($explicitUserId)) {
+            if ($hasUserIdCol) {
+                $cByUser = Customer::where('user_id', $explicitUserId)->first();
+                if ($cByUser) return $cByUser;
+            }
+            $u = User::find($explicitUserId);
+            if ($u) {
+                if ($hasEmailCol && !empty($u->email)) {
+                    $c = Customer::where('email', $u->email)->first();
+                    if ($c) return $c;
+                }
+                if ($hasNamaCol && !empty($u->name)) {
+                    $c = Customer::where('nama', $u->name)->first();
+                    if ($c) return $c;
+                }
+            }
+        }
+
+        // 2. Pencarian via customer_id / id / email / nama
         if (!empty($identifier)) {
             if (is_numeric($identifier)) {
                 $c = Customer::find($identifier);
@@ -163,6 +190,7 @@ $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
             }
         }
 
+        // 3. Fallback ke user yang sedang login
         $currentUser = Auth::user() ?? $reqUser;
         if ($currentUser) {
             if ($hasUserIdCol) {
@@ -183,6 +211,48 @@ $resolveCustomer = function ($identifier = null) use ($resolveCurrentUser) {
     } catch (\Throwable $e) {
         return null;
     }
+};
+
+// =========================================================================
+// HELPER GLOBAL: SINKRONISASI PRODUK DARI INVOICE (NAMA -> HARGA -> CUSTOMER)
+// =========================================================================
+$resolveProductFromInvoice = function ($invoice, $customer = null, $allProducts = null) {
+    try {
+        $products = $allProducts ?? Product::orderBy('id', 'asc')->get();
+        if ($products->isEmpty()) return null;
+
+        $rawName = trim((string) ($invoice->nama_produk ?? ''));
+        $cleanName = strtolower(trim(preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawName)));
+
+        // 1. Cocokkan nama_produk pada invoice dengan tabel products
+        if (!empty($cleanName)) {
+            foreach ($products as $p) {
+                $pName = strtolower(trim((string) ($p->nama_paket ?? $p->name ?? '')));
+                if ($pName !== '' && ($pName === $cleanName || str_contains($cleanName, $pName) || str_contains($pName, $cleanName))) {
+                    return $p;
+                }
+            }
+        }
+
+        // 2. Cocokkan nominal tagihan dengan harga produk
+        $nom = (double) ($invoice->total_tagihan ?? 0);
+        if ($nom > 0) {
+            foreach ($products as $p) {
+                $pHarga = (double) ($p->harga ?? $p->price ?? 0);
+                if ($pHarga > 0 && abs($pHarga - $nom) < 1) {
+                    return $p;
+                }
+            }
+        }
+
+        // 3. Fallback ke product_id milik customer
+        if ($customer && !empty($customer->product_id)) {
+            $byId = $products->firstWhere('id', $customer->product_id);
+            if ($byId) return $byId;
+        }
+    } catch (\Throwable $e) {}
+
+    return null;
 };
 
 // =========================================================================
@@ -274,7 +344,7 @@ $saveNotifState = function ($userKey, array $update) {
 // =========================================================================
 // HELPER FORMAT PROFIL CUSTOMER
 // =========================================================================
-$formatCustomerProfile = function ($customer = null, Request $request = null) use ($resolveCustomer, $resolveCurrentUser) {
+$formatCustomerProfile = function ($customer = null, Request $request = null) use ($resolveCustomer, $resolveCurrentUser, $resolveProductFromInvoice) {
     if (!$customer && $request) {
         $customer = $resolveCustomer($request);
     }
@@ -317,12 +387,19 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
         ->latest('id')
         ->first();
 
-    $tglBeliCarbon = $lastPaid ? Carbon::parse($lastPaid->tanggal_bayar ?? $lastPaid->updated_at) : null;
+    $tglBeliCarbon = $lastPaid ? Carbon::parse($lastPaid->tanggal_bayar ?? $lastPaid->updated_at ?? $lastPaid->created_at) : null;
     $tglJatuhTempoCarbon = $tglBeliCarbon ? $tglBeliCarbon->copy()->addMonth() : null;
     $masihMasaAktif = $tglJatuhTempoCarbon ? now()->lte($tglJatuhTempoCarbon) : false;
 
-    if ($lastPaid && !empty($lastPaid->nama_produk)) {
-        $namaPaketAktif = $lastPaid->nama_produk;
+    if ($lastPaid) {
+        if (!empty($lastPaid->nama_produk)) {
+            $namaPaketAktif = $lastPaid->nama_produk;
+        } else {
+            $matchedProd = $resolveProductFromInvoice($lastPaid, $customer);
+            $namaPaketAktif = $matchedProd
+                ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Paket Aktif')
+                : ($customer->nama_paket ?? 'Belum Ada Paket Aktif');
+        }
     } else {
         $namaPaketAktif = $customer->nama_paket ?? 'Belum Ada Paket Aktif';
     }
@@ -331,7 +408,11 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
 
     if ($invPending) {
         $tagihanRiil = (double) $invPending->total_tagihan;
-        $namaPaketPending = preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($invPending->nama_produk ?? 'Paket Baru'));
+        $pendingProd = empty($invPending->nama_produk) ? $resolveProductFromInvoice($invPending, $customer) : null;
+        $rawPendingName = !empty($invPending->nama_produk)
+            ? $invPending->nama_produk
+            : ($pendingProd ? ($pendingProd->nama_paket ?? $pendingProd->name) : 'Paket Baru');
+        $namaPaketPending = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawPendingName);
 
         $statusLangganan = $masihMasaAktif ? 'AKTIF' : 'BELUM_AKTIF';
         $statusKoneksi   = $masihMasaAktif ? 'Online' : 'Offline';
@@ -372,7 +453,7 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
             'no_hp'              => $customer->no_wa ?? $customer->no_hp ?? '-',
             'username_pppoe'     => $customer->pppoe_username ?? '-',
             'nama_paket'         => $namaPaketBersih,
-            'nama_paket_tagihan' => $invPending ? preg_replace('/^Pembayaran\s+Paket\s+/i', '', $invPending->nama_produk) : null,
+            'nama_paket_tagihan' => $invPending ? $namaPaketPending : null,
             'status'             => $statusLangganan,
             'status_koneksi'     => $statusKoneksi,
             'is_online'          => $isOnline,
@@ -386,33 +467,43 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
 };
 
 // =========================================================================
-// HANDLER DASHBOARD ADMIN (DENGAN AUTO-SYNC 4 PRODUK & DISTRIBUSI REALISTIS)
+// HANDLER DASHBOARD ADMIN (AUTO-SYNC PRODUK & DISTRIBUSI TRANSAKSI RIIL)
 // =========================================================================
-$handlerAdminDashboard = function (Request $request) {
+$handlerAdminDashboard = function (Request $request) use ($resolveProductFromInvoice) {
     try {
         // 1. AUTO-SYNC: Pastikan Produk ke-4 (Starter Kost Hemat) ada di Database
-        $starterExists = Product::where('nama_paket', 'LIKE', '%Starter%')
-            ->orWhere('name', 'LIKE', '%Starter%')
-            ->first();
+        $starterQuery = Product::query();
+        $hasNamaPaket = Schema::hasColumn('products', 'nama_paket');
+        $hasName      = Schema::hasColumn('products', 'name');
+
+        if ($hasNamaPaket && $hasName) {
+            $starterExists = $starterQuery->where('nama_paket', 'LIKE', '%Starter%')
+                ->orWhere('name', 'LIKE', '%Starter%')->first();
+        } elseif ($hasNamaPaket) {
+            $starterExists = $starterQuery->where('nama_paket', 'LIKE', '%Starter%')->first();
+        } elseif ($hasName) {
+            $starterExists = $starterQuery->where('name', 'LIKE', '%Starter%')->first();
+        } else {
+            $starterExists = null;
+        }
 
         if (!$starterExists) {
             $starterData = [];
-            if (Schema::hasColumn('products', 'nama_paket')) $starterData['nama_paket'] = 'Starter Kost Hemat';
-            if (Schema::hasColumn('products', 'name')) $starterData['name'] = 'Starter Kost Hemat';
+            if ($hasNamaPaket) $starterData['nama_paket'] = 'Starter Kost Hemat';
+            if ($hasName) $starterData['name'] = 'Starter Kost Hemat';
             if (Schema::hasColumn('products', 'harga')) $starterData['harga'] = 165000;
             if (Schema::hasColumn('products', 'price')) $starterData['price'] = 165000;
             if (Schema::hasColumn('products', 'kecepatan')) $starterData['kecepatan'] = '10 Mbps Fiber';
             if (Schema::hasColumn('products', 'speed')) $starterData['speed'] = '10 Mbps Fiber';
             if (Schema::hasColumn('products', 'deskripsi')) $starterData['deskripsi'] = 'Pilihan hemat untuk mahasiswa dan anak kost. Cukup untuk browsing dan tugas.';
             if (Schema::hasColumn('products', 'description')) $starterData['description'] = 'Pilihan hemat untuk mahasiswa dan anak kost. Cukup untuk browsing dan tugas.';
-            
+
             try {
                 Product::create($starterData);
             } catch (\Throwable $e) {}
         }
 
         $allProducts = Product::orderBy('id', 'asc')->get();
-        $productsById = $allProducts->keyBy('id');
         $totalProductsCount = (int) $allProducts->count();
 
         // 2. Data Pelanggan
@@ -442,34 +533,14 @@ $handlerAdminDashboard = function (Request $request) {
             return in_array(strtoupper(trim($inv->status ?? '')), ['PENDING', 'UNPAID', 'BELUM_BAYAR']);
         })->count();
 
-        // 4. Hitung Distribusi Produk Berdasarkan Invoices Riil
+        // 4. Distribusi Produk Berdasarkan Invoice Lunas (Sinkron: nama_produk -> harga -> product_id)
         $soldCountByProdId = [];
         $totalTerjual = 0;
 
         foreach ($paidInvoices as $inv) {
-            $matchedProdId = null;
-
-            // Coba cocokkan lewat product_id milik customer
             $cust = $customersById->get($inv->customer_id);
-            if ($cust && !empty($cust->product_id) && $productsById->has($cust->product_id)) {
-                $matchedProdId = $cust->product_id;
-            }
-
-            // Jika belum cocok, cocokkan lewat nominal harga
-            if (!$matchedProdId) {
-                $nom = (double) $inv->total_tagihan;
-                foreach ($allProducts as $p) {
-                    if ((double)$p->harga === $nom || (double)$p->price === $nom) {
-                        $matchedProdId = $p->id;
-                        break;
-                    }
-                }
-            }
-
-            // Fallback produk pertama jika tetap tidak cocok
-            if (!$matchedProdId && $allProducts->isNotEmpty()) {
-                $matchedProdId = $allProducts->first()->id;
-            }
+            $matchedProd = $resolveProductFromInvoice($inv, $cust, $allProducts);
+            $matchedProdId = $matchedProd ? $matchedProd->id : ($allProducts->isNotEmpty() ? $allProducts->first()->id : null);
 
             if ($matchedProdId) {
                 $soldCountByProdId[$matchedProdId] = ($soldCountByProdId[$matchedProdId] ?? 0) + 1;
@@ -565,22 +636,25 @@ Route::get('/admin/dashboard', fn(Request $r) => $handlerAdminDashboard($r));
 Route::get('/customer/dashboard', function (Request $r) use ($resolveCustomer, $formatCustomerProfile) {
     return $formatCustomerProfile($resolveCustomer($r), $r);
 });
-Route::get('/dashboard', function (Request $r) use ($resolveCustomer, $formatCustomerProfile, $handlerAdminDashboard, $checkIsAdmin) {
-    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id') && !$r->header('X-Customer-Id'))) {
+Route::get('/dashboard', function (Request $r) use ($resolveCustomer, $formatCustomerProfile, $handlerAdminDashboard, $checkIsAdmin, $resolveCurrentUser) {
+    if ($checkIsAdmin($r)) {
         return $handlerAdminDashboard($r);
     }
-    return $formatCustomerProfile($resolveCustomer($r), $r);
+    if ($resolveCurrentUser($r) || $r->has('customer_id') || $r->has('user_id') || $r->header('X-Customer-Id') || $r->header('X-User-Id')) {
+        return $formatCustomerProfile($resolveCustomer($r), $r);
+    }
+    return $handlerAdminDashboard($r);
 });
 
 // =========================================================================
 // ROUTE MUTASI ADMIN & CUSTOMER (DENGAN SINKRONISASI DATA UTUH)
 // =========================================================================
-$handlerMutasiAdmin = function (Request $request) {
+$handlerMutasiAdmin = function (Request $request) use ($resolveProductFromInvoice) {
     try {
         $invoices = Invoice::orderByDesc('id')->get();
         $customerIds = $invoices->pluck('customer_id')->filter()->unique();
-        $customersMap = Customer::whereIn('id', $customerIds)->pluck('nama', 'id');
-        $allProducts = Product::all()->keyBy('id');
+        $customersMap = Customer::whereIn('id', $customerIds)->get()->keyBy('id');
+        $allProducts = Product::orderBy('id', 'asc')->get();
 
         $list = [];
         $totalOmsetMasuk = 0.0;
@@ -595,16 +669,13 @@ $handlerMutasiAdmin = function (Request $request) {
                 $totalTerbayar++;
             }
 
-            // Nama produk cerdas
+            $cust = $customersMap->get($inv->customer_id);
             $namaProduk = trim($inv->nama_produk ?? '');
             if (empty($namaProduk)) {
-                if ($nominal >= 700000) {
-                    $namaProduk = 'Ultra Business Dedicated';
-                } elseif ($nominal >= 350000) {
-                    $namaProduk = 'Standard Pro Gamer';
-                } else {
-                    $namaProduk = 'Basic Home Fiber';
-                }
+                $matchedProd = $resolveProductFromInvoice($inv, $cust, $allProducts);
+                $namaProduk = $matchedProd
+                    ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Basic Home Fiber')
+                    : ($nominal >= 700000 ? 'Ultra Business Dedicated' : ($nominal >= 350000 ? 'Standard Pro Gamer' : 'Basic Home Fiber'));
             }
             $namaProdukBersih = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $namaProduk);
 
@@ -612,7 +683,7 @@ $handlerMutasiAdmin = function (Request $request) {
                 'id'                 => (int) $inv->id,
                 'nomor_invoice'      => (string) $inv->nomor_invoice,
                 'customer_id'        => $inv->customer_id,
-                'nama_customer'      => $customersMap[$inv->customer_id] ?? ('Pelanggan #' . $inv->customer_id),
+                'nama_customer'      => $cust ? ($cust->nama ?? $cust->name ?? ('Pelanggan #' . $inv->customer_id)) : ('Pelanggan #' . $inv->customer_id),
                 'nama_produk'        => 'Pembayaran Paket ' . $namaProdukBersih,
                 'product_name'       => $namaProdukBersih,
                 'total_tagihan'      => $nominal,
@@ -653,30 +724,20 @@ $handlerMutasiAdmin = function (Request $request) {
     }
 };
 
-$handlerMutasiCustomer = function (Request $request, $idParam = null) use ($resolveCustomer, $resolveCurrentUser) {
+$handlerMutasiCustomer = function (Request $request, $idParam = null) use ($resolveCustomer, $resolveProductFromInvoice) {
     try {
-        $identifier = $idParam 
-            ?? $request->query('customer_id') 
-            ?? $request->query('user_id') 
-            ?? $request->header('X-Customer-Id')
-            ?? $request->header('X-User-Id')
-            ?? $request->query('id') 
-            ?? $request->query('email')
-            ?? $request->input('customer_id')
-            ?? $request->input('user_id')
-            ?? $request->input('id');
-
-        if (empty($identifier)) {
-            $user = $resolveCurrentUser($request);
-            if ($user) $identifier = $user->email ?? $user->id;
+        $customer = !empty($idParam) ? $resolveCustomer($idParam) : null;
+        if (!$customer) {
+            $customer = $resolveCustomer($request);
         }
 
-        $customer = $resolveCustomer($identifier);
         $targetId = $customer ? $customer->id : null;
 
-        $invoices = $targetId 
+        $invoices = $targetId
             ? Invoice::where('customer_id', $targetId)->orderByDesc('id')->get()
             : collect([]);
+
+        $allProducts = Product::orderBy('id', 'asc')->get();
 
         $list = [];
         $totalPengeluaranLunas = 0.0;
@@ -691,13 +752,24 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
                 $jumlahLunas++;
             }
 
+            $rawProduk = trim($inv->nama_produk ?? '');
+            if (empty($rawProduk)) {
+                $matchedProd = $resolveProductFromInvoice($inv, $customer, $allProducts);
+                $rawProduk = $matchedProd
+                    ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Basic Home Fiber')
+                    : ($customer->nama_paket ?? 'Basic Home Fiber');
+            }
+            $namaProdukBersih = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawProduk);
+
             $list[] = [
                 'id'                 => (int) $inv->id,
                 'nomor_invoice'      => (string) $inv->nomor_invoice,
                 'customer_id'        => $inv->customer_id,
-                'nama_customer'      => $customer ? ($customer->nama ?? 'Pelanggan') : 'Pelanggan',
-                'nama_produk'        => 'Pembayaran Paket ' . preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($inv->nama_produk ?: 'Basic Home')),
+                'nama_customer'      => $customer ? ($customer->nama ?? $customer->name ?? 'Pelanggan') : 'Pelanggan',
+                'nama_produk'        => 'Pembayaran Paket ' . $namaProdukBersih,
+                'product_name'       => $namaProdukBersih,
                 'total_tagihan'      => $nominal,
+                'amount'             => $nominal,
                 'status'             => strtoupper($inv->status),
                 'is_paid'            => $isPaid,
                 'metode_pembayaran'  => $inv->metode_pembayaran ?? 'Xendit Multi Payment',
@@ -709,9 +781,11 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
         return response()->json([
             'success'            => true,
             'peran'              => 'customer',
+            'role'               => 'customer',
             'total_dana_masuk'   => $totalPengeluaranLunas,
             'total_pengeluaran'  => $totalPengeluaranLunas,
             'tagihan_terbayar'   => $jumlahLunas,
+            'tagihan_lunas'      => $jumlahLunas,
             'total_transaksi'    => count($list),
             'data'               => $list,
             'mutasi'             => $list,
@@ -730,20 +804,27 @@ Route::get('/mutasi-transaksi', fn(Request $r) => $handlerMutasiAdmin($r));
 Route::get('/admin/transactions', fn(Request $r) => $handlerMutasiAdmin($r));
 Route::get('/transactions', fn(Request $r) => $handlerMutasiAdmin($r));
 
+// Rute Mutasi & Tagihan Customer
 Route::get('/customer/mutasi', fn(Request $r) => $handlerMutasiCustomer($r));
+Route::get('/customer/mutasi/{id}', fn(Request $r, $id) => $handlerMutasiCustomer($r, $id));
+Route::get('/customer/invoices', fn(Request $r) => $handlerMutasiCustomer($r));
+Route::get('/customer/tagihan', fn(Request $r) => $handlerMutasiCustomer($r));
 
-// Rute umum /mutasi (Cerdas: jika tidak menyebutkan customer_id, otomatis arahkan ke Admin Mutasi)
-Route::get('/mutasi', function (Request $r) use ($handlerMutasiAdmin, $handlerMutasiCustomer, $checkIsAdmin) {
-    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id') && !$r->header('X-Customer-Id'))) {
+// Rute umum /mutasi
+Route::get('/mutasi', function (Request $r) use ($handlerMutasiAdmin, $handlerMutasiCustomer, $checkIsAdmin, $resolveCurrentUser) {
+    if ($checkIsAdmin($r)) {
         return $handlerMutasiAdmin($r);
     }
-    return $handlerMutasiCustomer($r);
+    if ($resolveCurrentUser($r) || $r->has('customer_id') || $r->has('user_id') || $r->header('X-Customer-Id') || $r->header('X-User-Id')) {
+        return $handlerMutasiCustomer($r);
+    }
+    return $handlerMutasiAdmin($r);
 });
 
 // =========================================================================
 // HANDLER NOTIFIKASI
 // =========================================================================
-$handlerAdminNotifications = function (Request $request) use ($getNotifState) {
+$handlerAdminNotifications = function (Request $request) use ($getNotifState, $resolveProductFromInvoice) {
     try {
         $adminKey = 'admin_system_notifications';
         $notifState = $getNotifState($adminKey);
@@ -753,7 +834,8 @@ $handlerAdminNotifications = function (Request $request) use ($getNotifState) {
 
         $invoices = Invoice::orderByDesc('id')->get();
         $customerIds = $invoices->pluck('customer_id')->filter()->unique();
-        $customersMap = Customer::whereIn('id', $customerIds)->pluck('nama', 'id');
+        $customersMap = Customer::whereIn('id', $customerIds)->get()->keyBy('id');
+        $allProducts = Product::orderBy('id', 'asc')->get();
 
         $notifications = [];
         $unreadCount = 0;
@@ -761,8 +843,16 @@ $handlerAdminNotifications = function (Request $request) use ($getNotifState) {
         foreach ($invoices as $inv) {
             $isPaid = in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
             $eventTime = Carbon::parse($inv->tanggal_bayar ?? $inv->created_at ?? now());
-            $namaPelanggan = $customersMap[$inv->customer_id] ?? ('Pelanggan #' . $inv->customer_id);
-            $namaPaket = preg_replace('/^Pembayaran\s+Paket\s+/i', '', ($inv->nama_produk ?: 'Basic Home'));
+            $cust = $customersMap->get($inv->customer_id);
+            $namaPelanggan = $cust ? ($cust->nama ?? $cust->name ?? ('Pelanggan #' . $inv->customer_id)) : ('Pelanggan #' . $inv->customer_id);
+
+            $rawProduk = trim($inv->nama_produk ?? '');
+            if (empty($rawProduk)) {
+                $matchedProd = $resolveProductFromInvoice($inv, $cust, $allProducts);
+                $rawProduk = $matchedProd ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Basic Home') : 'Basic Home';
+            }
+            $namaPaket = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawProduk);
+
             $nominalFmt = 'Rp ' . number_format($inv->total_tagihan, 0, ',', '.');
             $idNotif = 'admin-notif-' . $inv->id;
             $strId = (string) $inv->id;
@@ -779,7 +869,7 @@ $handlerAdminNotifications = function (Request $request) use ($getNotifState) {
             if (!$sudahDibaca) $unreadCount++;
 
             $judul = $isPaid ? 'Pembayaran Berhasil Diterima' : 'Tagihan Baru Menunggu Pembayaran';
-            $pesan = $isPaid 
+            $pesan = $isPaid
                 ? "Pembayaran paket {$namaPaket} dari {$namaPelanggan} sebesar {$nominalFmt} berhasil diverifikasi lunas."
                 : "Tagihan {$inv->nomor_invoice} untuk {$namaPelanggan} ({$namaPaket}) sebesar {$nominalFmt} menunggu konfirmasi bayar.";
 
@@ -826,28 +916,13 @@ $handlerAdminNotifications = function (Request $request) use ($getNotifState) {
     }
 };
 
-$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $getNotifState, $resolveCurrentUser, $handlerAdminNotifications, $checkIsAdmin) {
+$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $getNotifState, $handlerAdminNotifications, $checkIsAdmin, $resolveProductFromInvoice) {
     try {
         if ($checkIsAdmin($request)) {
             return $handlerAdminNotifications($request);
         }
 
-        $identifier = $request->query('customer_id') 
-            ?? $request->query('user_id') 
-            ?? $request->header('X-Customer-Id')
-            ?? $request->header('X-User-Id')
-            ?? $request->query('id') 
-            ?? $request->query('email')
-            ?? $request->input('customer_id')
-            ?? $request->input('user_id')
-            ?? $request->input('id');
-
-        if (empty($identifier)) {
-            $user = $resolveCurrentUser($request);
-            if ($user) $identifier = $user->email ?? $user->id;
-        }
-
-        $customer = $resolveCustomer($identifier);
+        $customer = $resolveCustomer($request);
         $targetId = $customer ? $customer->id : null;
 
         if (!$targetId) {
@@ -874,6 +949,7 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
             ->orderByDesc('id')
             ->get();
 
+        $allProducts = Product::orderBy('id', 'asc')->get();
         $notifications = [];
         $unreadCount = 0;
 
@@ -895,13 +971,18 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
             if (!$sudahDibaca) $unreadCount++;
 
             $rawProduk = trim($inv->nama_produk ?? '');
-            $namaPaket = !empty($rawProduk) ? $rawProduk : ($customer ? ($customer->nama_paket ?? 'Standar') : 'Standar');
-            $namaPaketClean = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $namaPaket);
+            if (empty($rawProduk)) {
+                $matchedProd = $resolveProductFromInvoice($inv, $customer, $allProducts);
+                $rawProduk = $matchedProd
+                    ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Standar')
+                    : ($customer ? ($customer->nama_paket ?? 'Standar') : 'Standar');
+            }
+            $namaPaketClean = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawProduk);
             $totalTagihan = (double) $inv->total_tagihan;
             $totalFmt = 'Rp ' . number_format($totalTagihan, 0, ',', '.');
 
             $judul = $isPaid ? 'Pembayaran Berhasil Diverifikasi' : 'Tagihan Internet Baru Diterbitkan';
-            $pesan = $isPaid 
+            $pesan = $isPaid
                 ? "Pembayaran paket {$namaPaketClean} Anda sebesar {$totalFmt} telah berhasil diverifikasi lunas."
                 : "Tagihan baru untuk paket {$namaPaketClean} sebesar {$totalFmt} telah diterbitkan. Silakan lakukan pembayaran.";
 
@@ -935,7 +1016,7 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
         }
 
         return response()->json([
-            'success'       => true, 
+            'success'       => true,
             'peran'         => 'customer',
             'role'          => 'customer',
             'unread_count'  => $unreadCount,
@@ -956,18 +1037,17 @@ Route::get('/customer/notifications', fn(Request $r) => $handlerCustomerNotifica
 Route::get('/customer/notification', fn(Request $r) => $handlerCustomerNotifications($r));
 Route::get('/customer/notifikasi', fn(Request $r) => $handlerCustomerNotifications($r));
 
-Route::get('/notifications', function (Request $r) use ($handlerAdminNotifications, $handlerCustomerNotifications, $checkIsAdmin) {
-    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerAdminNotifications($r);
-    return $handlerCustomerNotifications($r);
-});
-Route::get('/notification', function (Request $r) use ($handlerAdminNotifications, $handlerCustomerNotifications, $checkIsAdmin) {
-    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerAdminNotifications($r);
-    return $handlerCustomerNotifications($r);
-});
-Route::get('/notifikasi', function (Request $r) use ($handlerAdminNotifications, $handlerCustomerNotifications, $checkIsAdmin) {
-    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerAdminNotifications($r);
-    return $handlerCustomerNotifications($r);
-});
+$routeNotifSmart = function (Request $r) use ($handlerAdminNotifications, $handlerCustomerNotifications, $checkIsAdmin, $resolveCurrentUser) {
+    if ($checkIsAdmin($r)) return $handlerAdminNotifications($r);
+    if ($resolveCurrentUser($r) || $r->has('customer_id') || $r->has('user_id') || $r->header('X-Customer-Id') || $r->header('X-User-Id')) {
+        return $handlerCustomerNotifications($r);
+    }
+    return $handlerAdminNotifications($r);
+};
+
+Route::get('/notifications', $routeNotifSmart);
+Route::get('/notification', $routeNotifSmart);
+Route::get('/notifikasi', $routeNotifSmart);
 
 // Mark all read
 $handlerMarkAllReadAdmin = function () use ($saveNotifState) {
@@ -998,9 +1078,12 @@ $handlerMarkAllReadCustomer = function (Request $r) use ($saveNotifState, $resol
 
 Route::match(['GET', 'POST'], '/admin/notifications/mark-all-read', fn() => $handlerMarkAllReadAdmin());
 Route::match(['GET', 'POST'], '/customer/notifications/mark-all-read', fn(Request $r) => $handlerMarkAllReadCustomer($r));
-Route::match(['GET', 'POST'], '/notifications/mark-all-read', function (Request $r) use ($checkIsAdmin, $handlerMarkAllReadAdmin, $handlerMarkAllReadCustomer) {
-    if ($checkIsAdmin($r) || (!$r->has('customer_id') && !$r->has('user_id'))) return $handlerMarkAllReadAdmin();
-    return $handlerMarkAllReadCustomer($r);
+Route::match(['GET', 'POST'], '/notifications/mark-all-read', function (Request $r) use ($checkIsAdmin, $handlerMarkAllReadAdmin, $handlerMarkAllReadCustomer, $resolveCurrentUser) {
+    if ($checkIsAdmin($r)) return $handlerMarkAllReadAdmin();
+    if ($resolveCurrentUser($r) || $r->has('customer_id') || $r->has('user_id') || $r->header('X-Customer-Id') || $r->header('X-User-Id')) {
+        return $handlerMarkAllReadCustomer($r);
+    }
+    return $handlerMarkAllReadAdmin();
 });
 
 // Profile Resources
@@ -1017,7 +1100,7 @@ Route::apiResource('customers', CustomerController::class);
 Route::apiResource('products', ProductController::class);
 
 // Tagihan Aktif
-Route::get('/customer/invoice/active', function (Request $request) use ($resolveCustomer) {
+Route::get('/customer/invoice/active', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice) {
     try {
         $cust = $resolveCustomer($request);
 
@@ -1044,19 +1127,25 @@ Route::get('/customer/invoice/active', function (Request $request) use ($resolve
             ], 200);
         }
 
+        $namaProduk = $inv->nama_produk;
+        if (empty($namaProduk)) {
+            $matchedProd = $resolveProductFromInvoice($inv, $cust);
+            $namaProduk = $matchedProd ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Paket Internet') : 'Paket Internet';
+        }
+
         return response()->json([
             'success'     => true,
             'has_tagihan' => true,
             'data'        => [
-                'id'                => $inv->id,
-                'nomor_invoice'     => $inv->nomor_invoice,
-                'customer_id'       => $inv->customer_id,
-                'total_tagihan'     => (double) $inv->total_tagihan,
-                'status'            => $inv->status,
-                'nama_produk'       => $inv->nama_produk ?? 'Paket Internet',
-                'invoice_url'       => $inv->qr_image_url ?? null,
-                'qr_image_url'      => $inv->qr_image_url ?? null,
-                'qr_string'         => $inv->qr_string ?? null,
+                'id'            => $inv->id,
+                'nomor_invoice' => $inv->nomor_invoice,
+                'customer_id'   => $inv->customer_id,
+                'total_tagihan' => (double) $inv->total_tagihan,
+                'status'        => $inv->status,
+                'nama_produk'   => $namaProduk,
+                'invoice_url'   => $inv->qr_image_url ?? null,
+                'qr_image_url'  => $inv->qr_image_url ?? null,
+                'qr_string'     => $inv->qr_string ?? null,
             ],
         ], 200);
     } catch (\Throwable $e) {
@@ -1064,7 +1153,7 @@ Route::get('/customer/invoice/active', function (Request $request) use ($resolve
     }
 });
 
-// Xendit
+// Xendit Create Invoice
 $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer) {
     try {
         $customer = $resolveCustomer($request);
@@ -1073,17 +1162,39 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
         }
 
         $productId = $request->input('product_id');
-        $namaProdukInput = trim($request->input('nama_produk') ?? '');
+        $namaProdukInput = trim((string) ($request->input('nama_produk') ?? ''));
+        $nominalInput = (int) $request->input('nominal', 0);
 
         $product = null;
         if (!empty($productId)) {
             $product = Product::find($productId);
         } elseif (!empty($namaProdukInput)) {
-            $product = Product::where('nama_paket', $namaProdukInput)->first();
+            $cleanInput = trim(preg_replace('/^Pembayaran\s+Paket\s+/i', '', $namaProdukInput));
+            if (Schema::hasColumn('products', 'nama_paket')) {
+                $product = Product::where('nama_paket', $cleanInput)
+                    ->orWhere('nama_paket', $namaProdukInput)
+                    ->first();
+            }
+            if (!$product && Schema::hasColumn('products', 'name')) {
+                $product = Product::where('name', $cleanInput)
+                    ->orWhere('name', $namaProdukInput)
+                    ->first();
+            }
         }
 
-        $nominal = $product ? (int) $product->harga : (int) $request->input('nominal', 0);
-        $namaPaket = $product ? $product->nama_paket : (!empty($namaProdukInput) ? $namaProdukInput : 'Paket Internet');
+        if (!$product && $nominalInput > 0) {
+            foreach (Product::all() as $p) {
+                if ((int) ($p->harga ?? $p->price ?? 0) === $nominalInput) {
+                    $product = $p;
+                    break;
+                }
+            }
+        }
+
+        $nominal = $product ? (int) ($product->harga ?? $product->price ?? $nominalInput) : $nominalInput;
+        $namaPaket = $product
+            ? trim((string) ($product->nama_paket ?? $product->name ?? 'Paket Internet'))
+            : (!empty($namaProdukInput) ? $namaProdukInput : 'Paket Internet');
 
         if ($nominal < 10000) {
             return response()->json([
@@ -1138,19 +1249,21 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
         $invoiceUrl = $resData['invoice_url'];
 
         Invoice::where('customer_id', $customer->id)
-            ->whereIn('status', ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
+            ->whereIn(DB::raw('UPPER(status)'), ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
             ->delete();
 
-        $invoice = Invoice::create([
-            'nomor_invoice'     => $nomorInvoice,
-            'customer_id'       => $customer->id,
-            'total_tagihan'     => $nominal,
-            'status'            => 'PENDING',
-            'nama_produk'       => $namaPaket,
-            'metode_pembayaran' => 'Xendit Multi Payment',
-            'qr_image_url'      => $invoiceUrl,
-            'qr_string'         => $invoiceUrl,
-        ]);
+        $invoiceData = [
+            'nomor_invoice' => $nomorInvoice,
+            'customer_id'   => $customer->id,
+            'total_tagihan' => $nominal,
+            'status'        => 'PENDING',
+        ];
+        if (Schema::hasColumn('invoices', 'nama_produk')) $invoiceData['nama_produk'] = $namaPaket;
+        if (Schema::hasColumn('invoices', 'metode_pembayaran')) $invoiceData['metode_pembayaran'] = 'Xendit Multi Payment';
+        if (Schema::hasColumn('invoices', 'qr_image_url')) $invoiceData['qr_image_url'] = $invoiceUrl;
+        if (Schema::hasColumn('invoices', 'qr_string')) $invoiceData['qr_string'] = $invoiceUrl;
+
+        $invoice = Invoice::create($invoiceData);
 
         return response()->json([
             'success'       => true,
@@ -1171,8 +1284,8 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
 Route::post('/xendit/create-invoice', fn(Request $r) => $handlerCreateInvoiceXendit($r));
 Route::post('/xendit/create-qris', fn(Request $r) => $handlerCreateInvoiceXendit($r));
 
-// Cek Status Pembayaran
-Route::post('/invoices/check-status', function (Request $request) use ($resolveCustomer) {
+// Cek Status Pembayaran (Sekaligus sinkronkan paket aktif ke data customer)
+Route::post('/invoices/check-status', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice) {
     try {
         $nomorInvoice = trim($request->input('nomor_invoice', ''));
         $simulasi = $request->boolean('simulasi', false);
@@ -1194,11 +1307,8 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
         }
 
         $secretKey = env('XENDIT_SECRET_KEY', 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa');
-        $isPaid = false;
-
-        if (in_array(strtoupper(trim($invoice->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS'])) {
-            $isPaid = true;
-        }
+        $alreadyPaid = in_array(strtoupper(trim($invoice->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
+        $isPaid = $alreadyPaid;
 
         if (!$isPaid && !empty($secretKey)) {
             try {
@@ -1220,10 +1330,34 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
         if ($simulasi) $isPaid = true;
 
         if ($isPaid) {
-            $invoice->update(['status' => 'PAID', 'tanggal_bayar' => now()]);
-            $customer = $resolveCustomer($invoice->customer_id);
+            if (!$alreadyPaid || empty($invoice->tanggal_bayar)) {
+                $invoice->update([
+                    'status'        => 'PAID',
+                    'tanggal_bayar' => $invoice->tanggal_bayar ?? now(),
+                ]);
+            }
+
+            $customer = Customer::find($invoice->customer_id) ?? $resolveCustomer($invoice->customer_id);
             if ($customer) {
-                $customer->update(['status' => 'ACTIVE', 'status_koneksi' => 'Online']);
+                $custUpdate = [];
+                if (Schema::hasColumn('customers', 'status')) $custUpdate['status'] = 'ACTIVE';
+                if (Schema::hasColumn('customers', 'status_koneksi')) $custUpdate['status_koneksi'] = 'Online';
+
+                $matchedProd = $resolveProductFromInvoice($invoice, $customer);
+                if ($matchedProd) {
+                    if (Schema::hasColumn('customers', 'product_id')) {
+                        $custUpdate['product_id'] = $matchedProd->id;
+                    }
+                    if (Schema::hasColumn('customers', 'nama_paket')) {
+                        $custUpdate['nama_paket'] = $matchedProd->nama_paket ?? $matchedProd->name;
+                    }
+                } elseif (!empty($invoice->nama_produk) && Schema::hasColumn('customers', 'nama_paket')) {
+                    $custUpdate['nama_paket'] = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $invoice->nama_produk);
+                }
+
+                if (!empty($custUpdate)) {
+                    $customer->update($custUpdate);
+                }
             }
 
             return response()->json([
