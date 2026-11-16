@@ -1069,6 +1069,176 @@ Route::match(['GET', 'POST'], '/notifications/mark-all-read', function (Request 
     return $handlerMarkAllReadAdmin();
 });
 
+// =========================================================================
+// HANDLER TIKET PENGADUAN & BANTUAN (CUSTOMER & ADMIN + AUTO NOTIFIKASI)
+// =========================================================================
+$ensureTicketsTable = function () {
+    if (!Schema::hasTable('tickets')) {
+        Schema::create('tickets', function ($table) {
+            $table->id();
+            $table->string('nomor_tiket', 50)->unique();
+            $table->unsignedBigInteger('customer_id')->nullable();
+            $table->unsignedBigInteger('user_id')->nullable();
+            $table->string('nama_customer')->nullable();
+            $table->string('no_hp', 30)->nullable();
+            $table->string('nama_paket')->nullable();
+            $table->string('kategori', 100);
+            $table->text('pesan');
+            $table->string('status', 30)->default('MENUNGGU'); // MENUNGGU, DIPROSES, SELESAI
+            $table->text('balasan_admin')->nullable();
+            $table->timestamps();
+        });
+    }
+};
+
+// GET: Daftar Tiket Customer
+Route::get('/customer/tickets', function (Request $request) use ($ensureTicketsTable, $resolveCustomer) {
+    try {
+        $ensureTicketsTable();
+        $customer = $resolveCustomer($request);
+        if (!$customer) {
+            return response()->json(['success' => true, 'data' => []], 200);
+        }
+
+        $possibleUserIds = array_values(array_unique(array_filter([
+            $customer->user_id ?? null,
+            $customer->id ?? null,
+        ])));
+
+        $rows = DB::table('tickets')
+            ->where(function ($q) use ($customer, $possibleUserIds) {
+                $q->where('customer_id', $customer->id);
+                if (!empty($possibleUserIds)) {
+                    $q->orWhereIn('user_id', $possibleUserIds);
+                }
+            })
+            ->orderByDesc('id')
+            ->get();
+
+        return response()->json(['success' => true, 'data' => $rows], 200);
+    } catch (\Throwable $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+    }
+});
+
+// POST: Customer Membuat Tiket Baru -> Otomatis Notifikasi ke Admin
+Route::post('/customer/tickets', function (Request $request) use ($ensureTicketsTable, $resolveCustomer, $resolveCustomerUserId, $createNotification) {
+    try {
+        $ensureTicketsTable();
+        $customer = $resolveCustomer($request);
+        if (!$customer) {
+            return response()->json(['success' => false, 'message' => 'Data pelanggan tidak ditemukan.'], 404);
+        }
+
+        $kategori = trim((string) $request->input('kategori', 'Kendala Jaringan'));
+        $pesan    = trim((string) $request->input('pesan', ''));
+
+        if ($pesan === '') {
+            return response()->json(['success' => false, 'message' => 'Deskripsi keluhan/pengajuan wajib diisi.'], 422);
+        }
+
+        $nomorTiket = 'TKT-' . date('YmdHis') . '-' . $customer->id;
+        $namaCust   = $customer->nama ?? $customer->name ?? 'Pelanggan';
+        $noHp       = $customer->no_wa ?? $customer->no_hp ?? '-';
+        $namaPaket  = $customer->nama_paket ?? '-';
+        $custUserId = $resolveCustomerUserId($customer);
+
+        $id = DB::table('tickets')->insertGetId([
+            'nomor_tiket'   => $nomorTiket,
+            'customer_id'   => $customer->id,
+            'user_id'       => $custUserId,
+            'nama_customer' => $namaCust,
+            'no_hp'         => $noHp,
+            'nama_paket'    => $namaPaket,
+            'kategori'      => $kategori,
+            'pesan'         => $pesan,
+            'status'        => 'MENUNGGU',
+            'balasan_admin' => null,
+            'created_at'    => now(),
+            'updated_at'    => now(),
+        ]);
+
+        // Kirim notifikasi ke Admin
+        $createNotification(
+            null,
+            'admin',
+            "Tiket Bantuan Baru ({$nomorTiket})",
+            "{$namaCust} mengajukan bantuan kategori \"{$kategori}\": {$pesan}",
+            'WARNING'
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Tiket pengaduan berhasil dikirim ke Admin!',
+            'data'    => DB::table('tickets')->where('id', $id)->first(),
+        ], 201);
+    } catch (\Throwable $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+    }
+});
+
+// GET: Daftar Semua Tiket untuk Admin
+Route::get('/admin/tickets', function () use ($ensureTicketsTable) {
+    try {
+        $ensureTicketsTable();
+        $rows = DB::table('tickets')->orderByDesc('id')->get();
+        $pendingCount = $rows->where('status', 'MENUNGGU')->count();
+
+        return response()->json([
+            'success'       => true,
+            'pending_count' => $pendingCount,
+            'data'          => $rows,
+        ], 200);
+    } catch (\Throwable $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+    }
+});
+
+// POST: Admin Update Status & Balas Tiket -> Otomatis Notifikasi ke Customer
+Route::post('/admin/tickets/{id}/update', function (Request $request, $id) use ($ensureTicketsTable, $createNotification) {
+    try {
+        $ensureTicketsTable();
+        $ticket = DB::table('tickets')->where('id', $id)->first();
+        if (!$ticket) {
+            return response()->json(['success' => false, 'message' => 'Tiket tidak ditemukan.'], 404);
+        }
+
+        $status = strtoupper(trim((string) $request->input('status', 'DIPROSES')));
+        if (!in_array($status, ['MENUNGGU', 'DIPROSES', 'SELESAI'])) {
+            $status = 'DIPROSES';
+        }
+
+        $balasan = trim((string) $request->input('balasan_admin', ''));
+
+        DB::table('tickets')->where('id', $id)->update([
+            'status'        => $status,
+            'balasan_admin' => $balasan !== '' ? $balasan : $ticket->balasan_admin,
+            'updated_at'    => now(),
+        ]);
+
+        // Kirim notifikasi update ke Customer terkait
+        $notifType = $status === 'SELESAI' ? 'SUCCESS' : 'INFO';
+        $pesanNotif = "Status tiket {$ticket->nomor_tiket} ({$ticket->kategori}) diperbarui menjadi {$status}."
+            . ($balasan !== '' ? " Catatan Admin: {$balasan}" : '');
+
+        $createNotification(
+            $ticket->user_id ?? $ticket->customer_id,
+            'customer',
+            "Update Tiket Bantuan ({$status})",
+            $pesanNotif,
+            $notifType
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Tiket berhasil diperbarui & notifikasi dikirim ke pelanggan.',
+            'data'    => DB::table('tickets')->where('id', $id)->first(),
+        ], 200);
+    } catch (\Throwable $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+    }
+});
+
 // Profile Resources
 Route::get('/customer/profile/{identifier}', function ($identifier) use ($resolveCustomer, $formatCustomerProfile) {
     $cust = $resolveCustomer($identifier);
