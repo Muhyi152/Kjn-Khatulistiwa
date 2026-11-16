@@ -392,6 +392,7 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
                 'name'               => $user ? $user->name : 'Pelanggan Baru',
                 'email'              => $user ? $user->email : '-',
                 'no_hp'              => '-',
+                'alamat'             => '-',
                 'username_pppoe'     => '-',
                 'nama_paket'         => 'Belum Ada Paket Aktif',
                 'nama_paket_tagihan' => null,
@@ -483,6 +484,7 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
             'name'               => $customer->nama ?? $customer->name ?? 'Pelanggan',
             'email'              => $customer->email ?? '-',
             'no_hp'              => $customer->no_wa ?? $customer->no_hp ?? '-',
+            'alamat'             => $customer->alamat ?? $customer->address ?? '-',
             'username_pppoe'     => $customer->pppoe_username ?? '-',
             'nama_paket'         => $namaPaketBersih,
             'nama_paket_tagihan' => $invPending ? $namaPaketPending : null,
@@ -1072,6 +1074,46 @@ Route::get('/customer/profile/{identifier}', function ($identifier) use ($resolv
     $cust = $resolveCustomer($identifier);
     return $formatCustomerProfile($cust);
 });
+
+// Update Kontak Customer (Hanya Nama & No. WhatsApp/HP 
+Route::post('/customer/profile/update', function (Request $request) use ($resolveCustomer) {
+    try {
+        $customer = $resolveCustomer($request);
+        if (!$customer) {
+            return response()->json(['success' => false, 'message' => 'Data pelanggan tidak ditemukan.'], 404);
+        }
+
+        $nama = trim((string) $request->input('nama', ''));
+        $noHp = trim((string) ($request->input('no_hp') ?? $request->input('no_wa') ?? ''));
+
+        if ($nama === '' || $noHp === '') {
+            return response()->json(['success' => false, 'message' => 'Nama dan No. WhatsApp wajib diisi.'], 422);
+        }
+
+        $custUpdate = [];
+        if (Schema::hasColumn('customers', 'nama')) $custUpdate['nama'] = $nama;
+        if (Schema::hasColumn('customers', 'name')) $custUpdate['name'] = $nama;
+        if (Schema::hasColumn('customers', 'no_hp')) $custUpdate['no_hp'] = $noHp;
+        if (Schema::hasColumn('customers', 'no_wa')) $custUpdate['no_wa'] = $noHp;
+
+        if (!empty($custUpdate)) {
+            $customer->update($custUpdate);
+        }
+
+        // Sinkronkan nama ke tabel users juga jika terhubung
+        if (!empty($customer->user_id)) {
+            User::where('id', $customer->user_id)->update(['name' => $nama]);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Profil kontak berhasil diperbarui!',
+        ], 200);
+    } catch (\Throwable $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+    }
+});
+
 Route::get('/customers/{id}', function ($id) use ($resolveCustomer, $formatCustomerProfile) {
     $cust = $resolveCustomer($id);
     return $formatCustomerProfile($cust);
