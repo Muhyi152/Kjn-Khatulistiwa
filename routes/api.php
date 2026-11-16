@@ -256,89 +256,121 @@ $resolveProductFromInvoice = function ($invoice, $customer = null, $allProducts 
 };
 
 // =========================================================================
-// HELPER 2: PENYIMPANAN STATUS NOTIFIKASI
+// HELPER 2: PENYIMPANAN NOTIFIKASI LANGSUNG KE MYSQL (`notifications`)
 // =========================================================================
-$getNotifState = function ($userKey) {
-    $cleanKey = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string) $userKey);
-    $filePath = storage_path("app/notif_state_{$cleanKey}.json");
-
-    $data = [
-        'all_read_at'          => null,
-        'last_read_invoice_id' => 0,
-        'read_ids'             => [],
-    ];
-
-    if (file_exists($filePath)) {
-        $content = @file_get_contents($filePath);
-        $json = json_decode($content, true);
-        if (is_array($json)) {
-            $data['all_read_at']          = $json['all_read_at'] ?? null;
-            $data['last_read_invoice_id'] = (int) ($json['last_read_invoice_id'] ?? 0);
-            $data['read_ids']             = $json['read_ids'] ?? [];
-        }
+$resolveCustomerUserId = function ($customer) {
+    if (!$customer) return null;
+    if (!empty($customer->user_id)) return (int) $customer->user_id;
+    if (!empty($customer->email)) {
+        $u = User::where('email', $customer->email)->first();
+        if ($u) return (int) $u->id;
     }
-
-    $cacheAllRead = Cache::get("notif_all_read_{$cleanKey}");
-    if ($cacheAllRead && (!$data['all_read_at'] || $cacheAllRead > $data['all_read_at'])) {
-        $data['all_read_at'] = $cacheAllRead;
-    }
-
-    $cacheMaxId = (int) Cache::get("notif_max_id_{$cleanKey}", 0);
-    if ($cacheMaxId > $data['last_read_invoice_id']) {
-        $data['last_read_invoice_id'] = $cacheMaxId;
-    }
-
-    $cacheIds = Cache::get("notif_ids_{$cleanKey}", []);
-    if (is_array($cacheIds)) {
-        $data['read_ids'] = array_unique(array_merge($data['read_ids'], $cacheIds));
-    }
-
-    return data_get($data, null, $data);
+    return (int) $customer->id;
 };
 
-$saveNotifState = function ($userKey, array $update) {
-    $cleanKey = preg_replace('/[^a-zA-Z0-9_-]/', '_', (string) $userKey);
-    $filePath = storage_path("app/notif_state_{$cleanKey}.json");
+$createNotification = function (?int $userId, string $roleTarget, string $title, string $message, string $type = 'INFO', $createdAt = null) {
+    try {
+        if (!Schema::hasTable('notifications')) return;
 
-    if (!is_dir(storage_path('app'))) {
-        @mkdir(storage_path('app'), 0777, true);
-    }
+        $timestamp = $createdAt ? Carbon::parse($createdAt) : now();
+        $payload = [
+            'user_id'     => $userId,
+            'role_target' => strtolower(trim($roleTarget)),
+            'title'       => $title,
+            'message'     => $message,
+            'type'        => strtoupper(trim($type)),
+            'is_read'     => 0,
+            'created_at'  => $timestamp,
+            'updated_at'  => $timestamp,
+        ];
 
-    $existing = [
-        'all_read_at'          => null,
-        'last_read_invoice_id' => 0,
-        'read_ids'             => [],
-    ];
-
-    if (file_exists($filePath)) {
-        $content = @file_get_contents($filePath);
-        $json = json_decode($content, true);
-        if (is_array($json)) {
-            $existing = array_merge($existing, $json);
+        try {
+            DB::table('notifications')->insert($payload);
+        } catch (\Throwable $insertErr) {
+            // Fallback jika kolom user_id di DB diset NOT NULL (tidak nullable)
+            if ($userId === null) {
+                $adminUserId = User::whereIn(DB::raw('LOWER(role)'), ['admin', 'administrator'])->value('id') ?? 1;
+                $payload['user_id'] = $adminUserId;
+                DB::table('notifications')->insert($payload);
+            } else {
+                throw $insertErr;
+            }
         }
+    } catch (\Throwable $e) {
+        Log::error('Gagal simpan notifikasi: ' . $e->getMessage());
     }
+};
 
-    if (isset($update['all_read_at'])) {
-        $existing['all_read_at'] = $update['all_read_at'];
-        Cache::forever("notif_all_read_{$cleanKey}", $update['all_read_at']);
-    }
+// Sinkronisasi otomatis satu kali jika tabel notifications masih kosong tapi sudah ada riwayat invoice
+$syncOldInvoicesIfEmpty = function () use ($createNotification, $resolveCustomerUserId, $resolveProductFromInvoice) {
+    try {
+        if (!Schema::hasTable('notifications')) return;
+        if (DB::table('notifications')->count() > 0) return;
 
-    if (isset($update['last_read_invoice_id'])) {
-        $existing['last_read_invoice_id'] = (int) $update['last_read_invoice_id'];
-        Cache::forever("notif_max_id_{$cleanKey}", (int) $update['last_read_invoice_id']);
-    }
+        $invoices = Invoice::orderBy('id', 'asc')->get();
+        if ($invoices->isEmpty()) return;
 
-    if (isset($update['read_id'])) {
-        $existing['read_ids'][] = (string) $update['read_id'];
-        if (preg_match('/(\d+)/', (string) $update['read_id'], $m)) {
-            $existing['read_ids'][] = (string) $m[1];
+        $allProducts = Product::orderBy('id', 'asc')->get();
+
+        foreach ($invoices as $inv) {
+            $cust = Customer::find($inv->customer_id);
+            $namaCust = $cust ? ($cust->nama ?? $cust->name ?? ('Pelanggan #' . $inv->customer_id)) : ('Pelanggan #' . $inv->customer_id);
+
+            $rawProduk = trim((string) ($inv->nama_produk ?? ''));
+            if (empty($rawProduk)) {
+                $matchedProd = $resolveProductFromInvoice($inv, $cust, $allProducts);
+                $rawProduk = $matchedProd
+                    ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Paket Internet')
+                    : ($cust->nama_paket ?? 'Paket Internet');
+            }
+
+            $namaPaket   = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawProduk);
+            $nominalFmt  = 'Rp ' . number_format((double) $inv->total_tagihan, 0, ',', '.');
+            $statusUpper = strtoupper(trim($inv->status ?? ''));
+            $isPaid      = in_array($statusUpper, ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
+            $isCancelled = in_array($statusUpper, ['CANCELLED', 'BATAL']);
+            $custUserId  = $resolveCustomerUserId($cust);
+            $eventTime   = $inv->tanggal_bayar ?? $inv->created_at ?? now();
+
+            if ($isPaid) {
+                $createNotification(
+                    $custUserId,
+                    'customer',
+                    'Pembayaran Berhasil Diverifikasi',
+                    "Pembayaran {$inv->nomor_invoice} paket {$namaPaket} sebesar {$nominalFmt} telah berhasil diverifikasi lunas.",
+                    'SUCCESS',
+                    $eventTime
+                );
+                $createNotification(
+                    null,
+                    'admin',
+                    'Pembayaran Berhasil Diterima',
+                    "Pembayaran {$inv->nomor_invoice} dari {$namaCust} paket {$namaPaket} sebesar {$nominalFmt} telah lunas.",
+                    'SUCCESS',
+                    $eventTime
+                );
+            } elseif (!$isCancelled) {
+                $createNotification(
+                    $custUserId,
+                    'customer',
+                    'Tagihan Internet Baru Diterbitkan',
+                    "Tagihan {$inv->nomor_invoice} untuk paket {$namaPaket} sebesar {$nominalFmt} telah diterbitkan. Silakan lakukan pembayaran.",
+                    'WARNING',
+                    $inv->created_at ?? now()
+                );
+                $createNotification(
+                    null,
+                    'admin',
+                    'Tagihan Baru Menunggu Pembayaran',
+                    "Tagihan {$inv->nomor_invoice} dari {$namaCust} untuk paket {$namaPaket} sebesar {$nominalFmt} menunggu konfirmasi bayar.",
+                    'WARNING',
+                    $inv->created_at ?? now()
+                );
+            }
         }
-        $existing['read_ids'] = array_values(array_unique($existing['read_ids']));
-        Cache::forever("notif_ids_{$cleanKey}", $existing['read_ids']);
+    } catch (\Throwable $e) {
+        Log::error('Gagal sync notifikasi lama: ' . $e->getMessage());
     }
-
-    @file_put_contents($filePath, json_encode($existing));
-    return $existing;
 };
 
 // =========================================================================
@@ -533,7 +565,7 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
             return in_array(strtoupper(trim($inv->status ?? '')), ['PENDING', 'UNPAID', 'BELUM_BAYAR']);
         })->count();
 
-        // 4. Distribusi Produk Berdasarkan Invoice Lunas (Sinkron: nama_produk -> harga -> product_id)
+        // 4. Distribusi Produk Berdasarkan Invoice Lunas
         $soldCountByProdId = [];
         $totalTerjual = 0;
 
@@ -647,7 +679,7 @@ Route::get('/dashboard', function (Request $r) use ($resolveCustomer, $formatCus
 });
 
 // =========================================================================
-// ROUTE MUTASI ADMIN & CUSTOMER (DENGAN SINKRONISASI DATA UTUH)
+// ROUTE MUTASI ADMIN & CUSTOMER
 // =========================================================================
 $handlerMutasiAdmin = function (Request $request) use ($resolveProductFromInvoice) {
     try {
@@ -795,7 +827,6 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
     }
 };
 
-// Rute Mutasi Admin yang lengkap
 Route::get('/admin/mutasi', fn(Request $r) => $handlerMutasiAdmin($r));
 Route::get('/mutasi/admin', fn(Request $r) => $handlerMutasiAdmin($r));
 Route::get('/mutasi-admin', fn(Request $r) => $handlerMutasiAdmin($r));
@@ -804,13 +835,11 @@ Route::get('/mutasi-transaksi', fn(Request $r) => $handlerMutasiAdmin($r));
 Route::get('/admin/transactions', fn(Request $r) => $handlerMutasiAdmin($r));
 Route::get('/transactions', fn(Request $r) => $handlerMutasiAdmin($r));
 
-// Rute Mutasi & Tagihan Customer
 Route::get('/customer/mutasi', fn(Request $r) => $handlerMutasiCustomer($r));
 Route::get('/customer/mutasi/{id}', fn(Request $r, $id) => $handlerMutasiCustomer($r, $id));
 Route::get('/customer/invoices', fn(Request $r) => $handlerMutasiCustomer($r));
 Route::get('/customer/tagihan', fn(Request $r) => $handlerMutasiCustomer($r));
 
-// Rute umum /mutasi
 Route::get('/mutasi', function (Request $r) use ($handlerMutasiAdmin, $handlerMutasiCustomer, $checkIsAdmin, $resolveCurrentUser) {
     if ($checkIsAdmin($r)) {
         return $handlerMutasiAdmin($r);
@@ -822,84 +851,48 @@ Route::get('/mutasi', function (Request $r) use ($handlerMutasiAdmin, $handlerMu
 });
 
 // =========================================================================
-// HANDLER NOTIFIKASI
+// HANDLER NOTIFIKASI (TERHUBUNG LANGSUNG KE MYSQL `notifications`)
 // =========================================================================
-$handlerAdminNotifications = function (Request $request) use ($getNotifState, $resolveProductFromInvoice) {
+$formatNotifRow = function ($row) {
+    $createdAt = $row->created_at
+        ? Carbon::parse($row->created_at)->toIso8601String()
+        : now()->toIso8601String();
+    $isRead = (bool) $row->is_read;
+
+    return [
+        'id'              => (string) $row->id,
+        'notif_id'        => (string) $row->id,
+        'notification_id' => (string) $row->id,
+        'user_id'         => $row->user_id,
+        'role_target'     => $row->role_target,
+        'tipe'            => strtoupper($row->type ?? 'INFO'),
+        'type'            => strtoupper($row->type ?? 'INFO'),
+        'judul'           => $row->title ?? 'Pemberitahuan',
+        'title'           => $row->title ?? 'Pemberitahuan',
+        'pesan'           => $row->message ?? '',
+        'message'         => $row->message ?? '',
+        'body'            => $row->message ?? '',
+        'tanggal'         => $createdAt,
+        'waktu'           => $createdAt,
+        'created_at'      => $createdAt,
+        'timestamp'       => Carbon::parse($createdAt)->timestamp,
+        'is_read'         => $isRead,
+        'sudah_dibaca'    => $isRead,
+    ];
+};
+
+$handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $syncOldInvoicesIfEmpty) {
     try {
-        $adminKey = 'admin_system_notifications';
-        $notifState = $getNotifState($adminKey);
-        $allReadAt = !empty($notifState['all_read_at']) ? Carbon::parse($notifState['all_read_at']) : null;
-        $lastReadInvoiceId = (int) ($notifState['last_read_invoice_id'] ?? 0);
-        $readIds = $notifState['read_ids'] ?? [];
+        $syncOldInvoicesIfEmpty();
 
-        $invoices = Invoice::orderByDesc('id')->get();
-        $customerIds = $invoices->pluck('customer_id')->filter()->unique();
-        $customersMap = Customer::whereIn('id', $customerIds)->get()->keyBy('id');
-        $allProducts = Product::orderBy('id', 'asc')->get();
+        $rows = DB::table('notifications')
+            ->where('role_target', 'admin')
+            ->orderByDesc('id')
+            ->limit(100)
+            ->get();
 
-        $notifications = [];
-        $unreadCount = 0;
-
-        foreach ($invoices as $inv) {
-            $isPaid = in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
-            $eventTime = Carbon::parse($inv->tanggal_bayar ?? $inv->created_at ?? now());
-            $cust = $customersMap->get($inv->customer_id);
-            $namaPelanggan = $cust ? ($cust->nama ?? $cust->name ?? ('Pelanggan #' . $inv->customer_id)) : ('Pelanggan #' . $inv->customer_id);
-
-            $rawProduk = trim($inv->nama_produk ?? '');
-            if (empty($rawProduk)) {
-                $matchedProd = $resolveProductFromInvoice($inv, $cust, $allProducts);
-                $rawProduk = $matchedProd ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Basic Home') : 'Basic Home';
-            }
-            $namaPaket = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawProduk);
-
-            $nominalFmt = 'Rp ' . number_format($inv->total_tagihan, 0, ',', '.');
-            $idNotif = 'admin-notif-' . $inv->id;
-            $strId = (string) $inv->id;
-
-            $sudahDibaca = false;
-            if ($lastReadInvoiceId > 0 && $inv->id <= $lastReadInvoiceId) {
-                $sudahDibaca = true;
-            } elseif ($allReadAt && $eventTime->lte($allReadAt)) {
-                $sudahDibaca = true;
-            } elseif (in_array((string)$idNotif, $readIds) || in_array($strId, $readIds)) {
-                $sudahDibaca = true;
-            }
-
-            if (!$sudahDibaca) $unreadCount++;
-
-            $judul = $isPaid ? 'Pembayaran Berhasil Diterima' : 'Tagihan Baru Menunggu Pembayaran';
-            $pesan = $isPaid
-                ? "Pembayaran paket {$namaPaket} dari {$namaPelanggan} sebesar {$nominalFmt} berhasil diverifikasi lunas."
-                : "Tagihan {$inv->nomor_invoice} untuk {$namaPelanggan} ({$namaPaket}) sebesar {$nominalFmt} menunggu konfirmasi bayar.";
-
-            $notifications[] = [
-                'id'                 => $strId,
-                'notif_id'           => $idNotif,
-                'notification_id'    => $strId,
-                'tipe'               => $isPaid ? 'SUCCESS' : 'WARNING',
-                'type'               => $isPaid ? 'SUCCESS' : 'WARNING',
-                'judul'              => $judul,
-                'title'              => $judul,
-                'pesan'              => $pesan,
-                'message'            => $pesan,
-                'body'               => $pesan,
-                'nomor_invoice'      => (string) $inv->nomor_invoice,
-                'nama_customer'      => $namaPelanggan,
-                'total'              => (double) $inv->total_tagihan,
-                'total_tagihan'      => (double) $inv->total_tagihan,
-                'amount'             => (double) $inv->total_tagihan,
-                'status'             => $isPaid ? 'LUNAS' : 'PENDING',
-                'tanggal'            => $eventTime->toIso8601String(),
-                'waktu'              => $eventTime->toIso8601String(),
-                'created_at'         => $eventTime->toIso8601String(),
-                'tanggal_bayar'      => $eventTime->toIso8601String(),
-                'date'               => $eventTime->toIso8601String(),
-                'timestamp'          => $eventTime->timestamp,
-                'is_read'            => $sudahDibaca,
-                'sudah_dibaca'       => $sudahDibaca,
-            ];
-        }
+        $notifications = $rows->map($formatNotifRow)->values()->all();
+        $unreadCount = $rows->where('is_read', 0)->count();
 
         return response()->json([
             'success'       => true,
@@ -916,16 +909,16 @@ $handlerAdminNotifications = function (Request $request) use ($getNotifState, $r
     }
 };
 
-$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $getNotifState, $handlerAdminNotifications, $checkIsAdmin, $resolveProductFromInvoice) {
+$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $handlerAdminNotifications, $checkIsAdmin, $formatNotifRow, $syncOldInvoicesIfEmpty) {
     try {
         if ($checkIsAdmin($request)) {
             return $handlerAdminNotifications($request);
         }
 
-        $customer = $resolveCustomer($request);
-        $targetId = $customer ? $customer->id : null;
+        $syncOldInvoicesIfEmpty();
 
-        if (!$targetId) {
+        $customer = $resolveCustomer($request);
+        if (!$customer) {
             return response()->json([
                 'success'       => true,
                 'peran'         => 'customer',
@@ -938,82 +931,20 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
             ], 200);
         }
 
-        $userKey = 'customer_notif_' . $targetId;
-        $notifState = $getNotifState($userKey);
-        $allReadAt = !empty($notifState['all_read_at']) ? Carbon::parse($notifState['all_read_at']) : null;
-        $lastReadInvoiceId = (int) ($notifState['last_read_invoice_id'] ?? 0);
-        $readIds = $notifState['read_ids'] ?? [];
+        $possibleIds = array_values(array_unique(array_filter([
+            $customer->user_id ?? null,
+            $customer->id ?? null,
+        ])));
 
-        $invoices = Invoice::where('customer_id', $targetId)
-            ->whereNotIn(DB::raw('UPPER(status)'), ['CANCELLED', 'BATAL'])
+        $rows = DB::table('notifications')
+            ->where('role_target', 'customer')
+            ->whereIn('user_id', $possibleIds)
             ->orderByDesc('id')
+            ->limit(100)
             ->get();
 
-        $allProducts = Product::orderBy('id', 'asc')->get();
-        $notifications = [];
-        $unreadCount = 0;
-
-        foreach ($invoices as $inv) {
-            $isPaid = in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
-            $eventTime = Carbon::parse($inv->tanggal_bayar ?? $inv->created_at ?? now());
-            $strId = (string) $inv->id;
-            $idNotif = $isPaid ? ('cust-paid-' . $inv->id) : ('cust-pending-' . $inv->id);
-
-            $sudahDibaca = false;
-            if ($lastReadInvoiceId > 0 && $inv->id <= $lastReadInvoiceId) {
-                $sudahDibaca = true;
-            } elseif ($allReadAt && $eventTime->lte($allReadAt)) {
-                $sudahDibaca = true;
-            } elseif (in_array($idNotif, $readIds) || in_array($strId, $readIds)) {
-                $sudahDibaca = true;
-            }
-
-            if (!$sudahDibaca) $unreadCount++;
-
-            $rawProduk = trim($inv->nama_produk ?? '');
-            if (empty($rawProduk)) {
-                $matchedProd = $resolveProductFromInvoice($inv, $customer, $allProducts);
-                $rawProduk = $matchedProd
-                    ? ($matchedProd->nama_paket ?? $matchedProd->name ?? 'Standar')
-                    : ($customer ? ($customer->nama_paket ?? 'Standar') : 'Standar');
-            }
-            $namaPaketClean = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawProduk);
-            $totalTagihan = (double) $inv->total_tagihan;
-            $totalFmt = 'Rp ' . number_format($totalTagihan, 0, ',', '.');
-
-            $judul = $isPaid ? 'Pembayaran Berhasil Diverifikasi' : 'Tagihan Internet Baru Diterbitkan';
-            $pesan = $isPaid
-                ? "Pembayaran paket {$namaPaketClean} Anda sebesar {$totalFmt} telah berhasil diverifikasi lunas."
-                : "Tagihan baru untuk paket {$namaPaketClean} sebesar {$totalFmt} telah diterbitkan. Silakan lakukan pembayaran.";
-
-            $notifications[] = [
-                'id'              => $strId,
-                'notif_id'        => $idNotif,
-                'notification_id' => $strId,
-                'tipe'            => $isPaid ? 'SUCCESS' : 'WARNING',
-                'type'            => $isPaid ? 'SUCCESS' : 'WARNING',
-                'judul'           => $judul,
-                'title'           => $judul,
-                'pesan'           => $pesan,
-                'message'         => $pesan,
-                'body'            => $pesan,
-                'nomor_invoice'   => (string) $inv->nomor_invoice,
-                'nama_produk'     => $namaPaketClean,
-                'product_name'    => $namaPaketClean,
-                'total'           => $totalTagihan,
-                'total_tagihan'   => $totalTagihan,
-                'amount'          => $totalTagihan,
-                'status'          => $isPaid ? 'LUNAS' : 'MENUNGGU',
-                'tanggal'         => $eventTime->toIso8601String(),
-                'waktu'           => $eventTime->toIso8601String(),
-                'created_at'      => $eventTime->toIso8601String(),
-                'tanggal_bayar'   => $eventTime->toIso8601String(),
-                'date'            => $eventTime->toIso8601String(),
-                'timestamp'       => $eventTime->timestamp,
-                'is_read'         => $sudahDibaca,
-                'sudah_dibaca'    => $sudahDibaca,
-            ];
-        }
+        $notifications = $rows->map($formatNotifRow)->values()->all();
+        $unreadCount = $rows->where('is_read', 0)->count();
 
         return response()->json([
             'success'       => true,
@@ -1049,29 +980,79 @@ Route::get('/notifications', $routeNotifSmart);
 Route::get('/notification', $routeNotifSmart);
 Route::get('/notifikasi', $routeNotifSmart);
 
-// Mark all read
-$handlerMarkAllReadAdmin = function () use ($saveNotifState) {
-    $maxInvoiceId = (int) (Invoice::max('id') ?? 0);
-    $saveNotifState('admin_system_notifications', [
-        'all_read_at'          => Carbon::now()->toIso8601String(),
-        'last_read_invoice_id' => $maxInvoiceId,
-    ]);
+// Tandai SATU notifikasi dibaca
+Route::match(['GET', 'POST'], '/admin/notifications/{id}/read', function ($id) {
+    DB::table('notifications')
+        ->where('id', $id)
+        ->where('role_target', 'admin')
+        ->update(['is_read' => 1, 'updated_at' => now()]);
+
+    return response()->json(['success' => true, 'message' => 'Notifikasi admin ditandai dibaca.']);
+});
+
+Route::match(['GET', 'POST'], '/customer/notifications/{id}/read', function (Request $r, $id) use ($resolveCustomer, $checkIsAdmin) {
+    if ($checkIsAdmin($r)) {
+        DB::table('notifications')
+            ->where('id', $id)
+            ->where('role_target', 'admin')
+            ->update(['is_read' => 1, 'updated_at' => now()]);
+        return response()->json(['success' => true, 'message' => 'Notifikasi admin ditandai dibaca.']);
+    }
+
+    $customer = $resolveCustomer($r);
+    if ($customer) {
+        $possibleIds = array_values(array_unique(array_filter([
+            $customer->user_id ?? null,
+            $customer->id ?? null,
+        ])));
+        DB::table('notifications')
+            ->where('id', $id)
+            ->where('role_target', 'customer')
+            ->whereIn('user_id', $possibleIds)
+            ->update(['is_read' => 1, 'updated_at' => now()]);
+    }
+
+    return response()->json(['success' => true, 'message' => 'Notifikasi pelanggan ditandai dibaca.']);
+});
+
+Route::match(['GET', 'POST'], '/notifications/{id}/read', function (Request $r, $id) use ($resolveCustomer, $checkIsAdmin) {
+    if ($checkIsAdmin($r)) {
+        DB::table('notifications')->where('id', $id)->where('role_target', 'admin')->update(['is_read' => 1, 'updated_at' => now()]);
+        return response()->json(['success' => true]);
+    }
+    $customer = $resolveCustomer($r);
+    if ($customer) {
+        $possibleIds = array_values(array_unique(array_filter([$customer->user_id ?? null, $customer->id ?? null])));
+        DB::table('notifications')->where('id', $id)->where('role_target', 'customer')->whereIn('user_id', $possibleIds)->update(['is_read' => 1, 'updated_at' => now()]);
+    }
+    return response()->json(['success' => true]);
+});
+
+// Tandai SEMUA notifikasi dibaca
+$handlerMarkAllReadAdmin = function () {
+    DB::table('notifications')
+        ->where('role_target', 'admin')
+        ->where('is_read', 0)
+        ->update(['is_read' => 1, 'updated_at' => now()]);
+
     return response()->json(['success' => true, 'unread_count' => 0, 'unreadCount' => 0, 'message' => 'Semua notifikasi admin telah dibaca.']);
 };
 
-$handlerMarkAllReadCustomer = function (Request $r) use ($saveNotifState, $resolveCustomer, $handlerMarkAllReadAdmin, $checkIsAdmin) {
+$handlerMarkAllReadCustomer = function (Request $r) use ($resolveCustomer, $handlerMarkAllReadAdmin, $checkIsAdmin) {
     if ($checkIsAdmin($r)) {
         return $handlerMarkAllReadAdmin();
     }
     $customer = $resolveCustomer($r);
-    $targetId = $customer ? $customer->id : null;
-    $maxCustInv = $targetId ? (int) (Invoice::where('customer_id', $targetId)->max('id') ?? 0) : 0;
-
-    if ($targetId) {
-        $saveNotifState('customer_notif_' . $targetId, [
-            'all_read_at'          => Carbon::now()->toIso8601String(),
-            'last_read_invoice_id' => $maxCustInv,
-        ]);
+    if ($customer) {
+        $possibleIds = array_values(array_unique(array_filter([
+            $customer->user_id ?? null,
+            $customer->id ?? null,
+        ])));
+        DB::table('notifications')
+            ->where('role_target', 'customer')
+            ->whereIn('user_id', $possibleIds)
+            ->where('is_read', 0)
+            ->update(['is_read' => 1, 'updated_at' => now()]);
     }
     return response()->json(['success' => true, 'unread_count' => 0, 'unreadCount' => 0, 'message' => 'Semua notifikasi pelanggan telah ditandai dibaca.']);
 };
@@ -1154,7 +1135,7 @@ Route::get('/customer/invoice/active', function (Request $request) use ($resolve
 });
 
 // Xendit Create Invoice
-$handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer) {
+$handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer, $createNotification, $resolveCustomerUserId) {
     try {
         $customer = $resolveCustomer($request);
         if (!$customer) {
@@ -1265,6 +1246,27 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
 
         $invoice = Invoice::create($invoiceData);
 
+        // Simpan notifikasi tagihan baru untuk Customer & Admin ke MySQL
+        $nominalFmt = 'Rp ' . number_format($nominal, 0, ',', '.');
+        $namaCust   = $customer->nama ?? $customer->name ?? 'Pelanggan';
+        $custUserId = $resolveCustomerUserId($customer);
+
+        $createNotification(
+            $custUserId,
+            'customer',
+            'Tagihan Internet Baru Diterbitkan',
+            "Tagihan {$nomorInvoice} untuk paket {$namaPaket} sebesar {$nominalFmt} telah diterbitkan. Silakan lakukan pembayaran.",
+            'WARNING'
+        );
+
+        $createNotification(
+            null,
+            'admin',
+            'Tagihan Baru Menunggu Pembayaran',
+            "Tagihan {$nomorInvoice} untuk {$namaCust} paket {$namaPaket} sebesar {$nominalFmt} menunggu konfirmasi bayar.",
+            'WARNING'
+        );
+
         return response()->json([
             'success'       => true,
             'message'       => 'Tagihan Xendit berhasil diterbitkan!',
@@ -1284,8 +1286,8 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer)
 Route::post('/xendit/create-invoice', fn(Request $r) => $handlerCreateInvoiceXendit($r));
 Route::post('/xendit/create-qris', fn(Request $r) => $handlerCreateInvoiceXendit($r));
 
-// Cek Status Pembayaran (Sekaligus sinkronkan paket aktif ke data customer)
-Route::post('/invoices/check-status', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice) {
+// Cek Status Pembayaran (Sekaligus sinkronkan paket aktif & buat notifikasi lunas)
+Route::post('/invoices/check-status', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice, $createNotification, $resolveCustomerUserId) {
     try {
         $nomorInvoice = trim($request->input('nomor_invoice', ''));
         $simulasi = $request->boolean('simulasi', false);
@@ -1330,6 +1332,8 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
         if ($simulasi) $isPaid = true;
 
         if ($isPaid) {
+            $baruSajaLunas = !$alreadyPaid;
+
             if (!$alreadyPaid || empty($invoice->tanggal_bayar)) {
                 $invoice->update([
                     'status'        => 'PAID',
@@ -1358,6 +1362,34 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
                 if (!empty($custUpdate)) {
                     $customer->update($custUpdate);
                 }
+            }
+
+            // Simpan notifikasi lunas ke MySQL hanya sekali saat status berubah menjadi PAID
+            if ($baruSajaLunas) {
+                $namaPaketClean = preg_replace(
+                    '/^Pembayaran\s+Paket\s+/i',
+                    '',
+                    (string) ($invoice->nama_produk ?: ($customer->nama_paket ?? 'Internet'))
+                );
+                $nominalFmt = 'Rp ' . number_format((double) $invoice->total_tagihan, 0, ',', '.');
+                $namaCust   = $customer ? ($customer->nama ?? $customer->name ?? 'Pelanggan') : 'Pelanggan';
+                $custUserId = $resolveCustomerUserId($customer);
+
+                $createNotification(
+                    $custUserId,
+                    'customer',
+                    'Pembayaran Berhasil Diverifikasi',
+                    "Pembayaran {$invoice->nomor_invoice} paket {$namaPaketClean} sebesar {$nominalFmt} telah berhasil diverifikasi lunas.",
+                    'SUCCESS'
+                );
+
+                $createNotification(
+                    null,
+                    'admin',
+                    'Pembayaran Berhasil Diterima',
+                    "Pembayaran {$invoice->nomor_invoice} dari {$namaCust} paket {$namaPaketClean} sebesar {$nominalFmt} berhasil diverifikasi lunas.",
+                    'SUCCESS'
+                );
             }
 
             return response()->json([
@@ -1465,9 +1497,9 @@ Route::post('/login', function (Request $request) {
 });
 
 // =========================================================================
-// REGISTER (CUSTOMER BARU)
+// REGISTER (CUSTOMER BARU + NOTIFIKASI KE ADMIN & CUSTOMER)
 // =========================================================================
-Route::post('/register', function (Request $request) {
+Route::post('/register', function (Request $request) use ($createNotification) {
     try {
         $validated = $request->validate([
             'name'     => 'required|string|max:255',
@@ -1532,6 +1564,23 @@ Route::post('/register', function (Request $request) {
 
         $user = $result['user'];
         $customer = $result['customer'];
+
+        // Simpan notifikasi pendaftaran untuk Customer & Admin
+        $createNotification(
+            $user->id,
+            'customer',
+            'Selamat Datang di Portal Pelanggan',
+            "Halo {$user->name}, akun Anda berhasil terdaftar. Silakan pilih paket internet untuk mulai berlangganan.",
+            'INFO'
+        );
+
+        $createNotification(
+            null,
+            'admin',
+            'Pelanggan Baru Mendaftar',
+            "Pelanggan baru {$user->name} ({$user->email}) baru saja mendaftarkan akun.",
+            'INFO'
+        );
 
         $token = null;
         try {
