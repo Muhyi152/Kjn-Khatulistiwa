@@ -483,9 +483,9 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
             'nama'               => $customer->nama ?? $customer->name ?? 'Pelanggan',
             'name'               => $customer->nama ?? $customer->name ?? 'Pelanggan',
             'email'              => $customer->email ?? '-',
-            'no_hp'              => $customer->no_wa ?? $customer->no_hp ?? '-',
-            'alamat'             => $customer->alamat ?? $customer->address ?? '-',
-            'username_pppoe'     => $customer->pppoe_username ?? '-',
+            'no_hp'              => ($customer->no_wa ?? null) ?: (($customer->no_hp ?? null) ?: '-'),
+            'alamat'             => ($customer->alamat ?? null) ?: (($customer->address ?? null) ?: (($customer->alamat_pemasangan ?? null) ?: '-')),
+            'username_pppoe'     => ($customer->pppoe_username ?? null) ?: (($customer->username_pppoe ?? null) ?: '-'),
             'nama_paket'         => $namaPaketBersih,
             'nama_paket_tagihan' => $invPending ? $namaPaketPending : null,
             'status'             => $statusLangganan,
@@ -524,7 +524,7 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
         if (!$starterExists) {
             $starterData = [];
             if ($hasNamaPaket) $starterData['nama_paket'] = 'Starter Kost Hemat';
-            if ($hasName) $starterData['name'] = 'Starter Kost Hemat';
+            if (Schema::hasColumn('products', 'name')) $starterData['name'] = 'Starter Kost Hemat';
             if (Schema::hasColumn('products', 'harga')) $starterData['harga'] = 165000;
             if (Schema::hasColumn('products', 'price')) $starterData['price'] = 165000;
             if (Schema::hasColumn('products', 'kecepatan')) $starterData['kecepatan'] = '10 Mbps Fiber';
@@ -1245,7 +1245,7 @@ Route::get('/customer/profile/{identifier}', function ($identifier) use ($resolv
     return $formatCustomerProfile($cust);
 });
 
-// Update Kontak Customer (Hanya Nama & No. WhatsApp/HP 
+// Update Kontak Customer (Hanya Nama & No. WhatsApp/HP)
 Route::post('/customer/profile/update', function (Request $request) use ($resolveCustomer) {
     try {
         $customer = $resolveCustomer($request);
@@ -1288,6 +1288,226 @@ Route::get('/customers/{id}', function ($id) use ($resolveCustomer, $formatCusto
     $cust = $resolveCustomer($id);
     return $formatCustomerProfile($cust);
 })->where('id', '[0-9]+');
+
+// =========================================================================
+// HANDLER UPDATE PELANGGAN (ADMIN) - FIX USERNAME PPPoE, ALAMAT & STATUS
+// =========================================================================
+$handlerUpdateCustomer = function (Request $request, $id = null) {
+    try {
+        $targetId = $id ?? $request->input('id') ?? $request->input('customer_id');
+        if (empty($targetId)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'ID pelanggan tidak ditemukan.',
+            ], 422);
+        }
+
+        $customer = Customer::find($targetId);
+        if (!$customer) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Data pelanggan tidak ditemukan di database.',
+            ], 404);
+        }
+
+        // Pastikan kolom pppoe_username & alamat tersedia jika sebelumnya belum ada di tabel
+        try {
+            if (!Schema::hasColumn('customers', 'pppoe_username') && !Schema::hasColumn('customers', 'username_pppoe')) {
+                Schema::table('customers', function ($table) {
+                    $table->string('pppoe_username')->nullable();
+                });
+            }
+            if (!Schema::hasColumn('customers', 'alamat') && !Schema::hasColumn('customers', 'address') && !Schema::hasColumn('customers', 'alamat_pemasangan')) {
+                Schema::table('customers', function ($table) {
+                    $table->text('alamat')->nullable();
+                });
+            }
+        } catch (\Throwable $schemaErr) {}
+
+        $updateData = [];
+        $namaClean = null;
+
+        // 1. Nama Pelanggan
+        if ($request->hasAny(['nama', 'name', 'nama_pelanggan'])) {
+            $namaClean = trim((string) ($request->input('nama') ?? $request->input('name') ?? $request->input('nama_pelanggan') ?? ''));
+            if ($namaClean === '') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Nama pelanggan wajib diisi.',
+                ], 422);
+            }
+            if (Schema::hasColumn('customers', 'nama')) $updateData['nama'] = $namaClean;
+            if (Schema::hasColumn('customers', 'name')) $updateData['name'] = $namaClean;
+        }
+
+        // 2. No. WhatsApp / HP
+        if ($request->hasAny(['no_hp', 'no_wa', 'phone', 'telepon', 'no_telp'])) {
+            $hpInput = trim((string) ($request->input('no_hp') ?? $request->input('no_wa') ?? $request->input('phone') ?? $request->input('telepon') ?? $request->input('no_telp') ?? ''));
+            if (Schema::hasColumn('customers', 'no_wa')) $updateData['no_wa'] = $hpInput;
+            if (Schema::hasColumn('customers', 'no_hp')) $updateData['no_hp'] = $hpInput;
+            if (Schema::hasColumn('customers', 'phone')) $updateData['phone'] = $hpInput;
+        }
+
+        // 3. Username PPPoE
+        if ($request->hasAny(['username_pppoe', 'pppoe_username', 'pppoe', 'username'])) {
+            $pppoeInput = trim((string) ($request->input('username_pppoe') ?? $request->input('pppoe_username') ?? $request->input('pppoe') ?? $request->input('username') ?? ''));
+            $pppoeVal = ($pppoeInput === '' || $pppoeInput === '-') ? null : $pppoeInput;
+
+            if (Schema::hasColumn('customers', 'pppoe_username')) $updateData['pppoe_username'] = $pppoeVal;
+            if (Schema::hasColumn('customers', 'username_pppoe')) $updateData['username_pppoe'] = $pppoeVal;
+        }
+
+        // 4. Alamat Pemasangan
+        if ($request->hasAny(['alamat', 'address', 'alamat_pemasangan'])) {
+            $alamatInput = trim((string) ($request->input('alamat') ?? $request->input('address') ?? $request->input('alamat_pemasangan') ?? ''));
+            $alamatVal = ($alamatInput === '' || $alamatInput === '-') ? null : $alamatInput;
+
+            if (Schema::hasColumn('customers', 'alamat')) $updateData['alamat'] = $alamatVal;
+            if (Schema::hasColumn('customers', 'address')) $updateData['address'] = $alamatVal;
+            if (Schema::hasColumn('customers', 'alamat_pemasangan')) $updateData['alamat_pemasangan'] = $alamatVal;
+        }
+
+        // 5. Email (jika dikirim)
+        if ($request->has('email') && Schema::hasColumn('customers', 'email')) {
+            $emailInput = trim((string) $request->input('email', ''));
+            if ($emailInput !== '' && $emailInput !== '-') {
+                $updateData['email'] = $emailInput;
+            }
+        }
+
+        // 6. Pilihan Paket Internet (product_id & nama_paket)
+        $productIdInput = $request->input('product_id') ?? $request->input('paket_id');
+        $namaPaketInput = $request->input('nama_paket') ?? $request->input('paket');
+
+        $matchedProduct = null;
+        if (!empty($productIdInput)) {
+            $matchedProduct = Product::find($productIdInput);
+        } elseif (!empty($namaPaketInput)) {
+            $cleanPaket = trim((string) $namaPaketInput);
+            if (Schema::hasColumn('products', 'nama_paket')) {
+                $matchedProduct = Product::where('nama_paket', $cleanPaket)->first();
+            }
+            if (!$matchedProduct && Schema::hasColumn('products', 'name')) {
+                $matchedProduct = Product::where('name', $cleanPaket)->first();
+            }
+        }
+
+        if ($matchedProduct) {
+            if (Schema::hasColumn('customers', 'product_id')) {
+                $updateData['product_id'] = $matchedProduct->id;
+            }
+            if (Schema::hasColumn('customers', 'nama_paket')) {
+                $updateData['nama_paket'] = $matchedProduct->nama_paket ?? $matchedProduct->name ?? $namaPaketInput;
+            }
+        } else {
+            if (!empty($productIdInput) && Schema::hasColumn('customers', 'product_id')) {
+                $updateData['product_id'] = (int) $productIdInput;
+            }
+            if (!empty($namaPaketInput) && Schema::hasColumn('customers', 'nama_paket')) {
+                $updateData['nama_paket'] = trim((string) $namaPaketInput);
+            }
+        }
+
+        // 7. Status Langganan
+        if ($request->hasAny(['status', 'status_langganan'])) {
+            $rawStatus = strtoupper(trim((string) ($request->input('status') ?? $request->input('status_langganan') ?? '')));
+            $isActiveStatus = (
+                str_contains($rawStatus, 'AKTIF')
+                && !str_contains($rawStatus, 'NONAKTIF')
+                && !str_contains($rawStatus, 'NON-AKTIF')
+                && !str_contains($rawStatus, 'TIDAK')
+                && !str_contains($rawStatus, 'BELUM')
+            ) || in_array($rawStatus, ['ACTIVE', 'ONLINE', 'ENABLE', 'ENABLED', '1']);
+            $isIsolirStatus = str_contains($rawStatus, 'ISOLIR') || str_contains($rawStatus, 'SUSPEND') || str_contains($rawStatus, 'BLOKIR');
+
+            if (Schema::hasColumn('customers', 'status')) {
+                $finalStatus = $isActiveStatus ? 'ACTIVE' : ($isIsolirStatus ? 'ISOLIR' : 'INACTIVE');
+
+                // Sesuaikan otomatis jika kolom status di MySQL bertipe ENUM
+                try {
+                    $colInfo = DB::select("SHOW COLUMNS FROM customers LIKE 'status'");
+                    if (!empty($colInfo)) {
+                        $colType = $colInfo[0]->Type ?? '';
+                        if (preg_match("/^enum\((.*)\)$/i", $colType, $matches)) {
+                            $allowed = array_map(fn($v) => trim($v, " '\""), explode(',', $matches[1]));
+                            $allowedUpper = array_map('strtoupper', $allowed);
+
+                            $candidates = $isActiveStatus
+                                ? ['ACTIVE', 'AKTIF', 'ONLINE', 'ENABLED']
+                                : ($isIsolirStatus ? ['ISOLIR', 'SUSPENDED', 'INACTIVE', 'NONAKTIF'] : ['INACTIVE', 'BELUM_AKTIF', 'NONAKTIF', 'ISOLIR']);
+
+                            foreach ($candidates as $cand) {
+                                $idx = array_search($cand, $allowedUpper, true);
+                                if ($idx !== false) {
+                                    $finalStatus = $allowed[$idx];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (\Throwable $enumErr) {}
+
+                $updateData['status'] = $finalStatus;
+            }
+
+            if (Schema::hasColumn('customers', 'status_koneksi')) {
+                $updateData['status_koneksi'] = $isActiveStatus ? 'Online' : 'Offline';
+            }
+        }
+
+        if (Schema::hasColumn('customers', 'updated_at')) {
+            $updateData['updated_at'] = now();
+        }
+
+        // Update langsung via Query Builder agar tidak gagal karena $fillable pada Model Customer
+        if (!empty($updateData)) {
+            DB::table('customers')->where('id', $customer->id)->update($updateData);
+        }
+
+        // Sinkronkan nama ke tabel users jika terhubung
+        if (!empty($customer->user_id) && $namaClean !== null) {
+            try {
+                User::where('id', $customer->user_id)->update(['name' => $namaClean]);
+            } catch (\Throwable $userErr) {}
+        }
+
+        $fresh = Customer::find($customer->id);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Data pelanggan berhasil diperbarui!',
+            'data'    => [
+                'id'             => (int) $fresh->id,
+                'nama'           => $fresh->nama ?? $fresh->name ?? '',
+                'name'           => $fresh->nama ?? $fresh->name ?? '',
+                'no_hp'          => $fresh->no_wa ?? $fresh->no_hp ?? '',
+                'no_wa'          => $fresh->no_wa ?? $fresh->no_hp ?? '',
+                'username_pppoe' => $fresh->pppoe_username ?? $fresh->username_pppoe ?? '',
+                'pppoe_username' => $fresh->pppoe_username ?? $fresh->username_pppoe ?? '',
+                'alamat'         => $fresh->alamat ?? $fresh->address ?? $fresh->alamat_pemasangan ?? '',
+                'address'        => $fresh->alamat ?? $fresh->address ?? $fresh->alamat_pemasangan ?? '',
+                'product_id'     => $fresh->product_id ?? null,
+                'nama_paket'     => $fresh->nama_paket ?? null,
+                'status'         => $fresh->status ?? 'ACTIVE',
+                'status_koneksi' => $fresh->status_koneksi ?? 'Online',
+            ],
+        ], 200);
+
+    } catch (\Throwable $e) {
+        Log::error('Gagal update customer: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Gagal memperbarui data pelanggan: ' . $e->getMessage(),
+        ], 500);
+    }
+};
+
+Route::match(['PUT', 'PATCH', 'POST'], '/customers/{id}', $handlerUpdateCustomer)->where('id', '[0-9]+');
+Route::post('/customers/{id}/update', $handlerUpdateCustomer)->where('id', '[0-9]+');
+Route::post('/customers/update', $handlerUpdateCustomer);
+Route::match(['PUT', 'PATCH', 'POST'], '/admin/customers/{id}', $handlerUpdateCustomer)->where('id', '[0-9]+');
+Route::post('/admin/customers/{id}/update', $handlerUpdateCustomer)->where('id', '[0-9]+');
+Route::post('/admin/customers/update', $handlerUpdateCustomer);
 
 Route::apiResource('customers', CustomerController::class);
 Route::apiResource('products', ProductController::class);
