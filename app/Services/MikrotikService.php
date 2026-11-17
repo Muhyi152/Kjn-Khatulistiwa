@@ -7,7 +7,8 @@ use Illuminate\Support\Facades\Http;
 class MikrotikService
 {
     /**
-     * Test koneksi & ambil info dasar router (untuk REST v7 / API v6 / Simulasi)
+     * Test koneksi & ambil info dasar router
+     * Mendukung: simulasi | rest_v7 | api_v6 | api_ssl | ssh
      */
     public function testAndFetchResource(array $router): array
     {
@@ -32,7 +33,12 @@ class MikrotikService
             return $this->fetchResourceRestV7($router);
         }
 
-        return $this->fetchResourceApiV6($router);
+        if ($type === 'ssh') {
+            return $this->fetchResourceSsh($router);
+        }
+
+        // api_v6 (8728) dan api_ssl (8729)
+        return $this->fetchResourceApiV6($router, $type === 'api_ssl');
     }
 
     /**
@@ -51,7 +57,11 @@ class MikrotikService
             return $this->fetchMonitoringRestV7($router, $meta);
         }
 
-        return $this->fetchMonitoringApiV6($router, $meta);
+        if ($type === 'ssh') {
+            return $this->fetchMonitoringSsh($router, $meta);
+        }
+
+        return $this->fetchMonitoringApiV6($router, $meta, $type === 'api_ssl');
     }
 
     /**
@@ -70,7 +80,11 @@ class MikrotikService
             return $this->executeRestV7Action($router, $meta, $action, $params);
         }
 
-        return $this->executeApiV6Action($router, $meta, $action, $params);
+        if ($type === 'ssh') {
+            return $this->executeSshAction($router, $meta, $action, $params);
+        }
+
+        return $this->executeApiV6Action($router, $meta, $action, $params, $type === 'api_ssl');
     }
 
     // =========================================================================
@@ -267,6 +281,18 @@ class MikrotikService
                 }
                 return ['message' => "Sesi {$username} berhasil diputus.", 'meta_json' => $meta];
 
+            case 'reset_user':
+                $username = trim((string) ($params['username'] ?? 'all'));
+                $actives = $username === 'all'
+                    ? $this->restGet($router, '/ppp/active')
+                    : $this->restGet($router, '/ppp/active?name=' . urlencode($username));
+                foreach ($actives as $act) {
+                    if (!empty($act['.id'])) {
+                        $this->restPost($router, '/ppp/active/remove', ['.id' => $act['.id']]);
+                    }
+                }
+                return ['message' => $username === 'all' ? 'Seluruh sesi pengguna berhasil di-reset.' : "Sesi {$username} berhasil di-reset.", 'meta_json' => $meta];
+
             case 'limit_bandwidth':
                 $target = trim((string) ($params['target'] ?? $params['username'] ?? ''));
                 $up     = trim((string) ($params['upload_limit'] ?? '10M'));
@@ -314,18 +340,31 @@ class MikrotikService
     }
 
     // =========================================================================
-    // 2. ROUTEROS V6 & V7 BINARY API (PURE PHP SOCKET - PORT 8728)
+    // 2. ROUTEROS V6 & V7 BINARY API (PLAIN 8728 & API-SSL TLS 8729)
     // =========================================================================
-    private function apiConnect(array $router)
+    private function apiConnect(array $router, bool $useSsl = false)
     {
         $host = trim((string) ($router['ip_host'] ?? ''));
-        $port = (int) ($router['port'] ?? 8728);
+        $port = (int) ($router['port'] ?? ($useSsl ? 8729 : 8728));
         $user = (string) ($router['username'] ?? 'admin');
         $pass = (string) ($router['password'] ?? '');
 
-        $sock = @fsockopen($host, $port, $errno, $errstr, 5);
+        if ($useSsl) {
+            $ctx = stream_context_create([
+                'ssl' => [
+                    'verify_peer'       => false,
+                    'verify_peer_name'  => false,
+                    'allow_self_signed' => true,
+                ],
+            ]);
+            $sock = @stream_socket_client("tls://{$host}:{$port}", $errno, $errstr, 5, STREAM_CLIENT_CONNECT, $ctx);
+        } else {
+            $sock = @fsockopen($host, $port, $errno, $errstr, 5);
+        }
+
         if (!$sock) {
-            throw new \RuntimeException("Tidak dapat terhubung ke {$host}:{$port} ({$errstr})");
+            $label = $useSsl ? 'API-SSL' : 'API';
+            throw new \RuntimeException("Tidak dapat terhubung ({$label}) ke {$host}:{$port} ({$errstr})");
         }
         stream_set_timeout($sock, 5);
 
@@ -430,17 +469,24 @@ class MikrotikService
             $b3 = ord(fread($sock, 1));
             return (($c & ~0xE0) << 16) + ($b2 << 8) + $b3;
         }
+        if (($c & 0xF0) === 0xE0) {
+            $b2 = ord(fread($sock, 1));
+            $b3 = ord(fread($sock, 1));
+            $b4 = ord(fread($sock, 1));
+            return (($c & ~0xF0) << 24) + ($b2 << 16) + ($b3 << 8) + $b4;
+        }
         return 0;
     }
 
-    private function fetchResourceApiV6(array $router): array
+    private function fetchResourceApiV6(array $router, bool $useSsl = false): array
     {
-        $sock = $this->apiConnect($router);
+        $sock = $this->apiConnect($router, $useSsl);
         try {
             $rows = $this->apiComm($sock, ['/system/resource/print']);
             $res = $rows[0] ?? [];
             $totalMemMb = isset($res['total-memory']) ? round(((float) $res['total-memory']) / 1048576) : 0;
             $freeMemMb  = isset($res['free-memory']) ? round(((float) $res['free-memory']) / 1048576) : 0;
+            $protoLabel = $useSsl ? 'API-SSL' : 'API';
 
             return [
                 'online'     => true,
@@ -451,16 +497,16 @@ class MikrotikService
                 'memory'     => $totalMemMb > 0 ? "{$totalMemMb} MB" : ($router['memory_info'] ?: '-'),
                 'free_mem'   => $freeMemMb > 0 ? "{$freeMemMb} MB" : '-',
                 'uptime'     => $res['uptime'] ?? '-',
-                'message'    => 'Terhubung ke MikroTik API Port ' . ($router['port'] ?? 8728),
+                'message'    => "Terhubung ke MikroTik {$protoLabel} Port " . ($router['port'] ?? ($useSsl ? 8729 : 8728)),
             ];
         } finally {
             fclose($sock);
         }
     }
 
-    private function fetchMonitoringApiV6(array $router, array $meta): array
+    private function fetchMonitoringApiV6(array $router, array $meta, bool $useSsl = false): array
     {
-        $sock = $this->apiConnect($router);
+        $sock = $this->apiConnect($router, $useSsl);
         try {
             $resRows     = $this->apiComm($sock, ['/system/resource/print']);
             $res         = $resRows[0] ?? [];
@@ -556,14 +602,15 @@ class MikrotikService
         }
     }
 
-    private function executeApiV6Action(array $router, array $meta, string $action, array $params): array
+    private function executeApiV6Action(array $router, array $meta, string $action, array $params, bool $useSsl = false): array
     {
-        $sock = $this->apiConnect($router);
+        $sock = $this->apiConnect($router, $useSsl);
         try {
+            $protoLabel = $useSsl ? 'API-SSL' : 'API v6';
             switch ($action) {
                 case 'restart_router':
                     $this->apiComm($sock, ['/system/reboot']);
-                    return ['message' => 'Router sedang restart (API v6).', 'meta_json' => $meta];
+                    return ['message' => "Router sedang restart ({$protoLabel}).", 'meta_json' => $meta];
 
                 case 'disable_pppoe':
                 case 'block_customer':
@@ -595,6 +642,18 @@ class MikrotikService
                     }
                     return ['message' => "Sesi {$username} diputus.", 'meta_json' => $meta];
 
+                case 'reset_user':
+                    $username = trim((string) ($params['username'] ?? 'all'));
+                    $actives = $username === 'all'
+                        ? $this->apiComm($sock, ['/ppp/active/print'])
+                        : $this->apiComm($sock, ['/ppp/active/print', '?name=' . $username]);
+                    foreach ($actives as $act) {
+                        if (!empty($act['.id'])) {
+                            $this->apiComm($sock, ['/ppp/active/remove', '=.id=' . $act['.id']]);
+                        }
+                    }
+                    return ['message' => $username === 'all' ? 'Seluruh sesi pengguna berhasil di-reset.' : "Sesi {$username} berhasil di-reset.", 'meta_json' => $meta];
+
                 case 'limit_bandwidth':
                     $target = trim((string) ($params['target'] ?? $params['username'] ?? ''));
                     $up     = trim((string) ($params['upload_limit'] ?? '10M'));
@@ -615,11 +674,181 @@ class MikrotikService
                     $this->apiComm($sock, ['/interface/enable', '=numbers=' . $iface]);
                     return ['message' => "Interface {$iface} di-restart.", 'meta_json' => $meta];
 
+                case 'ping_test':
+                    $target = trim((string) ($params['target'] ?? '8.8.8.8'));
+                    $pingRes = $this->apiComm($sock, ['/ping', '=address=' . $target, '=count=3']);
+                    $avg = 0;
+                    $loss = 0;
+                    if (!empty($pingRes)) {
+                        $times = [];
+                        $sent = count($pingRes);
+                        $ok = 0;
+                        foreach ($pingRes as $row) {
+                            if (!empty($row['time'])) {
+                                $ok++;
+                                $times[] = (int) filter_var($row['time'], FILTER_SANITIZE_NUMBER_INT);
+                            }
+                        }
+                        $avg = !empty($times) ? (int) round(array_sum($times) / count($times)) : 0;
+                        $loss = $sent > 0 ? (int) round((($sent - $ok) / $sent) * 100) : 0;
+                    }
+                    $meta['last_ping'] = ['target' => $target, 'avg_ms' => $avg, 'packet_loss' => $loss];
+                    return ['message' => "Ping {$target}: {$avg} ms (Loss {$loss}%)", 'meta_json' => $meta, 'ping' => $meta['last_ping']];
+
                 default:
                     return $this->executeSimulatedAction($router, $meta, $action, $params);
             }
         } finally {
             fclose($sock);
+        }
+    }
+
+    // =========================================================================
+    // 2B. SSH REMOTE CLI (PORT 22 - MENGGUNAKAN EXT-SSH2 JIKA TERPASANG)
+    // =========================================================================
+    private function sshExec(array $router, string $command): string
+    {
+        $host = trim((string) ($router['ip_host'] ?? ''));
+        $port = (int) ($router['port'] ?? 22);
+        $user = (string) ($router['username'] ?? 'admin');
+        $pass = (string) ($router['password'] ?? '');
+
+        if (!function_exists('ssh2_connect')) {
+            $fp = @fsockopen($host, $port, $errno, $errstr, 3);
+            if (!$fp) {
+                throw new \RuntimeException("SSH tidak dapat menjangkau {$host}:{$port} ({$errstr}).");
+            }
+            fclose($fp);
+            throw new \RuntimeException(
+                "Port SSH {$host}:{$port} terbuka, namun ekstensi PHP 'ext-ssh2' belum aktif di server. " .
+                "Silakan aktifkan ext-ssh2 atau gunakan protokol API-SSL (8729) / API (8728) / REST v7 (443)."
+            );
+        }
+
+        $conn = @\ssh2_connect($host, $port);
+        if (!$conn) {
+            throw new \RuntimeException("Gagal membuat koneksi SSH ke {$host}:{$port}.");
+        }
+        if (!@\ssh2_auth_password($conn, $user, $pass)) {
+            throw new \RuntimeException('Autentikasi SSH MikroTik gagal (username/password salah).');
+        }
+
+        $stream = @\ssh2_exec($conn, $command);
+        if (!$stream) {
+            throw new \RuntimeException("Gagal mengeksekusi perintah SSH: {$command}");
+        }
+        stream_set_blocking($stream, true);
+        $output = stream_get_contents($stream);
+        fclose($stream);
+
+        return trim((string) $output);
+    }
+
+    private function parseSshKeyValue(string $raw): array
+    {
+        $out = [];
+        foreach (preg_split('/\r?\n/', $raw) as $line) {
+            if (preg_match('/^\s*([a-zA-Z0-9\-]+)\s*:\s*(.+)$/', $line, $m)) {
+                $out[strtolower(trim($m[1]))] = trim($m[2]);
+            }
+        }
+        return $out;
+    }
+
+    private function fetchResourceSsh(array $router): array
+    {
+        $raw = $this->sshExec($router, '/system resource print without-paging');
+        $kv = $this->parseSshKeyValue($raw);
+
+        return [
+            'online'     => true,
+            'model'      => $kv['board-name'] ?? ($router['model'] ?: 'MikroTik'),
+            'os_version' => $kv['version'] ?? ($router['os_version'] ?: 'RouterOS'),
+            'cpu'        => trim(($kv['cpu-count'] ?? '1') . ' Core, ' . ($kv['cpu-frequency'] ?? '-')),
+            'cpu_load'   => (int) filter_var($kv['cpu-load'] ?? '0', FILTER_SANITIZE_NUMBER_INT),
+            'memory'     => $kv['total-memory'] ?? ($router['memory_info'] ?: '-'),
+            'free_mem'   => $kv['free-memory'] ?? '-',
+            'uptime'     => $kv['uptime'] ?? '-',
+            'message'    => 'Terhubung ke MikroTik via SSH Port ' . ($router['port'] ?? 22),
+        ];
+    }
+
+    private function fetchMonitoringSsh(array $router, array $meta): array
+    {
+        $resource = $this->fetchResourceSsh($router);
+        $bwIn  = (float) ($meta['bandwidth_in'] ?? 12.5);
+        $bwOut = (float) ($meta['bandwidth_out'] ?? 18.7);
+
+        return [
+            'router_info'      => $resource,
+            'internet_enabled' => (bool) ($meta['internet_enabled'] ?? true),
+            'active_users'     => (int) ($meta['active_users'] ?? 0),
+            'bandwidth_in'     => $bwIn,
+            'bandwidth_out'    => $bwOut,
+            'traffic_history'  => $meta['traffic_history'] ?? $this->defaultTrafficHistory($bwIn, $bwOut),
+            'pppoe_users'      => $meta['pppoe_users'] ?? [],
+            'dhcp_leases'      => $meta['dhcp_leases'] ?? [],
+            'hotspot_active'   => $meta['hotspot_active'] ?? [],
+            'interfaces'       => $meta['interfaces'] ?? [],
+            'queues'           => $meta['queues'] ?? [],
+            'ping'             => $meta['last_ping'] ?? ['target' => '8.8.8.8', 'avg_ms' => 14, 'packet_loss' => 0],
+            'system_logs'      => $meta['system_logs'] ?? [],
+            'blocked_sites'    => $meta['blocked_sites'] ?? [],
+            'meta_json'        => $meta,
+        ];
+    }
+
+    private function executeSshAction(array $router, array $meta, string $action, array $params): array
+    {
+        $esc = fn(string $v) => '"' . str_replace(['"', '$', '`'], '', $v) . '"';
+
+        switch ($action) {
+            case 'restart_router':
+                $this->sshExec($router, '/system reboot');
+                return ['message' => 'Perintah restart dikirim via SSH.', 'meta_json' => $meta];
+
+            case 'disable_pppoe':
+            case 'block_customer':
+                $u = trim((string) ($params['username'] ?? ''));
+                $this->sshExec($router, "/ppp secret disable [find name={$esc($u)}]");
+                $this->sshExec($router, "/ppp active remove [find name={$esc($u)}]");
+                return ['message' => "PPPoE {$u} dinonaktifkan via SSH.", 'meta_json' => $meta];
+
+            case 'enable_pppoe':
+            case 'activate_customer':
+                $u = trim((string) ($params['username'] ?? ''));
+                $this->sshExec($router, "/ppp secret enable [find name={$esc($u)}]");
+                return ['message' => "PPPoE {$u} diaktifkan via SSH.", 'meta_json' => $meta];
+
+            case 'disconnect_user':
+                $u = trim((string) ($params['username'] ?? ''));
+                $this->sshExec($router, "/ppp active remove [find name={$esc($u)}]");
+                return ['message' => "Sesi {$u} diputus via SSH.", 'meta_json' => $meta];
+
+            case 'reset_user':
+                $u = trim((string) ($params['username'] ?? 'all'));
+                $cmd = $u === 'all' ? '/ppp active remove [find]' : "/ppp active remove [find name={$esc($u)}]";
+                $this->sshExec($router, $cmd);
+                return ['message' => $u === 'all' ? 'Seluruh sesi di-reset via SSH.' : "Sesi {$u} di-reset via SSH.", 'meta_json' => $meta];
+
+            case 'limit_bandwidth':
+                $target = trim((string) ($params['target'] ?? $params['username'] ?? ''));
+                $up     = trim((string) ($params['upload_limit'] ?? '10M'));
+                $down   = trim((string) ($params['download_limit'] ?? '20M'));
+                $limit  = "{$up}/{$down}";
+                $this->sshExec(
+                    $router,
+                    ":if ([:len [/queue simple find name={$esc($target)}]] > 0) do={/queue simple set [find name={$esc($target)}] max-limit={$limit}} else={/queue simple add name={$esc($target)} target={$esc($target)} max-limit={$limit}}"
+                );
+                return ['message' => "Limit bandwidth {$target} diatur ke {$limit} via SSH.", 'meta_json' => $meta];
+
+            case 'restart_interface':
+                $iface = trim((string) ($params['interface_name'] ?? 'ether1'));
+                $this->sshExec($router, "/interface disable {$esc($iface)}; :delay 300ms; /interface enable {$esc($iface)}");
+                return ['message' => "Interface {$iface} di-restart via SSH.", 'meta_json' => $meta];
+
+            default:
+                return $this->executeSimulatedAction($router, $meta, $action, $params);
         }
     }
 

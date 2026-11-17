@@ -12,6 +12,9 @@ use Illuminate\Support\Facades\Crypt;
 
 class NetworkController extends Controller
 {
+    private const ALLOWED_CONN_TYPES = ['simulasi', 'api_v6', 'api_ssl', 'rest_v7', 'ssh'];
+    private const ALLOWED_AUTH_MODES = ['campuran', 'pppoe', 'hotspot', 'dhcp', 'radius', 'ipoe'];
+
     public function __construct(private MikrotikService $mikrotik)
     {
     }
@@ -27,8 +30,8 @@ class NetworkController extends Controller
                 $table->integer('port')->default(8728);
                 $table->string('username')->default('admin');
                 $table->text('password_encrypted')->nullable();
-                $table->string('connection_type', 30)->default('simulasi'); // simulasi | rest_v7 | api_v6
-                $table->string('auth_mode', 30)->default('campuran');       // pppoe | hotspot | dhcp | campuran
+                $table->string('connection_type', 30)->default('simulasi'); // simulasi | api_v6 | api_ssl | rest_v7 | ssh
+                $table->string('auth_mode', 30)->default('campuran');       // campuran | pppoe | hotspot | dhcp | radius | ipoe
                 $table->string('model')->nullable();
                 $table->string('os_version')->nullable();
                 $table->string('cpu_info')->nullable();
@@ -148,6 +151,16 @@ class NetworkController extends Controller
         }
     }
 
+    private function defaultPortForType(string $connType): int
+    {
+        return match ($connType) {
+            'api_ssl' => 8729,
+            'rest_v7' => 443,
+            'ssh'     => 22,
+            default   => 8728,
+        };
+    }
+
     private function encryptPassword(?string $plain): string
     {
         if ($plain === null || $plain === '') return '';
@@ -212,23 +225,19 @@ class NetworkController extends Controller
             $activeUsers = 0;
             $bwIn = 0.0;
             $bwOut = 0.0;
+            $uptime = $meta['uptime'] ?? '12d 4h 32m';
+            $cpuLoad = (int) ($meta['cpu_load'] ?? 20);
 
-            if ($row->connection_type !== 'simulasi') {
-                try {
-                    $mon = $this->mikrotik->getMonitoringData($arr);
-                    $isOnline = (bool) ($mon['router_info']['online'] ?? true);
-                    $activeUsers = (int) ($mon['active_users'] ?? 0);
-                    $bwIn = (float) ($mon['bandwidth_in'] ?? 0);
-                    $bwOut = (float) ($mon['bandwidth_out'] ?? 0);
-                } catch (\Throwable $e) {
-                    $isOnline = false;
-                }
-            } else {
+            try {
                 $mon = $this->mikrotik->getMonitoringData($arr);
                 $isOnline = (bool) ($mon['router_info']['online'] ?? true);
                 $activeUsers = (int) ($mon['active_users'] ?? 0);
                 $bwIn = (float) ($mon['bandwidth_in'] ?? 0);
                 $bwOut = (float) ($mon['bandwidth_out'] ?? 0);
+                $uptime = $mon['router_info']['uptime'] ?? $uptime;
+                $cpuLoad = (int) ($mon['router_info']['cpu_load'] ?? $cpuLoad);
+            } catch (\Throwable $e) {
+                $isOnline = $row->connection_type === 'simulasi';
             }
 
             if ($isOnline) $onlineCount++;
@@ -251,8 +260,8 @@ class NetworkController extends Controller
                 'memory_info'      => $row->memory_info ?? '-',
                 'is_online'        => $isOnline,
                 'internet_enabled' => (bool) ($meta['internet_enabled'] ?? true),
-                'uptime'           => $meta['uptime'] ?? '12d 4h 32m',
-                'cpu_load'         => (int) ($meta['cpu_load'] ?? 20),
+                'uptime'           => $uptime,
+                'cpu_load'         => $cpuLoad,
                 'active_users'     => $activeUsers,
                 'bandwidth_in'     => round($bwIn, 1),
                 'bandwidth_out'    => round($bwOut, 1),
@@ -262,12 +271,12 @@ class NetworkController extends Controller
         return response()->json([
             'success' => true,
             'summary' => [
-                'total_routers'      => count($list),
-                'online_routers'     => $onlineCount,
-                'offline_routers'    => max(0, count($list) - $onlineCount),
-                'total_active_users' => $totalActiveUsers,
-                'total_bandwidth_in' => round($totalBwIn, 1),
-                'total_bandwidth_out'=> round($totalBwOut, 1),
+                'total_routers'       => count($list),
+                'online_routers'      => $onlineCount,
+                'offline_routers'     => max(0, count($list) - $onlineCount),
+                'total_active_users'  => $totalActiveUsers,
+                'total_bandwidth_in'  => round($totalBwIn, 1),
+                'total_bandwidth_out' => round($totalBwOut, 1),
             ],
             'data' => $list,
         ]);
@@ -285,8 +294,20 @@ class NetworkController extends Controller
             return response()->json(['success' => false, 'message' => 'Nama router wajib diisi.'], 422);
         }
 
-        $connType = $request->input('connection_type', 'simulasi');
-        $port = (int) $request->input('port', $connType === 'rest_v7' ? 443 : 8728);
+        $connTypeInput = strtolower(trim((string) $request->input('connection_type', 'simulasi')));
+        if (!in_array($connTypeInput, self::ALLOWED_CONN_TYPES, true)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Protokol API tidak valid. Pilihan: ' . implode(', ', self::ALLOWED_CONN_TYPES),
+            ], 422);
+        }
+
+        $authModeInput = strtolower(trim((string) $request->input('auth_mode', 'campuran')));
+        if (!in_array($authModeInput, self::ALLOWED_AUTH_MODES, true)) {
+            $authModeInput = 'campuran';
+        }
+
+        $port = (int) ($request->input('port') ?: $this->defaultPortForType($connTypeInput));
 
         $payload = [
             'name'               => $name,
@@ -295,8 +316,8 @@ class NetworkController extends Controller
             'port'               => $port,
             'username'           => trim((string) $request->input('username', 'admin')),
             'password_encrypted' => $this->encryptPassword((string) $request->input('password', '')),
-            'connection_type'    => $connType,
-            'auth_mode'          => $request->input('auth_mode', 'campuran'),
+            'connection_type'    => $connTypeInput,
+            'auth_mode'          => $authModeInput,
             'model'              => $request->input('model', 'MikroTik'),
             'os_version'         => $request->input('os_version', '7.x'),
             'cpu_info'           => $request->input('cpu_info', '1 Core'),
@@ -313,7 +334,14 @@ class NetworkController extends Controller
         ];
 
         $id = DB::table('routers')->insertGetId($payload);
-        $this->writeAuditLog($id, $name, $request->input('admin_name', 'Admin'), 'add_router', $payload['ip_host'], "Menambahkan router {$name} ({$payload['ip_host']}).");
+        $this->writeAuditLog(
+            $id,
+            $name,
+            (string) $request->input('admin_name', 'Admin'),
+            'add_router',
+            $payload['ip_host'],
+            "Menambahkan router {$name} ({$payload['ip_host']}:{$port} • {$connTypeInput} • {$authModeInput})."
+        );
 
         return response()->json(['success' => true, 'message' => 'Router berhasil ditambahkan!', 'id' => $id], 201);
     }
@@ -328,9 +356,25 @@ class NetworkController extends Controller
         if (!$row) return response()->json(['success' => false, 'message' => 'Router tidak ditemukan.'], 404);
 
         $update = ['updated_at' => now()];
-        foreach (['name', 'location', 'ip_host', 'username', 'connection_type', 'auth_mode', 'model', 'os_version'] as $f) {
+        foreach (['name', 'location', 'ip_host', 'username', 'model', 'os_version'] as $f) {
             if ($request->has($f)) $update[$f] = $request->input($f);
         }
+
+        if ($request->has('connection_type')) {
+            $ct = strtolower(trim((string) $request->input('connection_type')));
+            if (!in_array($ct, self::ALLOWED_CONN_TYPES, true)) {
+                return response()->json(['success' => false, 'message' => 'Protokol API tidak valid.'], 422);
+            }
+            $update['connection_type'] = $ct;
+        }
+
+        if ($request->has('auth_mode')) {
+            $am = strtolower(trim((string) $request->input('auth_mode')));
+            if (in_array($am, self::ALLOWED_AUTH_MODES, true)) {
+                $update['auth_mode'] = $am;
+            }
+        }
+
         if ($request->has('port')) $update['port'] = (int) $request->input('port');
         if ($request->filled('password')) {
             $update['password_encrypted'] = $this->encryptPassword((string) $request->input('password'));
@@ -385,7 +429,15 @@ class NetworkController extends Controller
         $found = [];
 
         if ($host !== '') {
-            foreach ([8728 => 'api_v6', 443 => 'rest_v7', 80 => 'rest_v7'] as $port => $type) {
+            $probePorts = [
+                8729 => 'api_ssl',
+                8728 => 'api_v6',
+                443  => 'rest_v7',
+                80   => 'rest_v7',
+                22   => 'ssh',
+            ];
+
+            foreach ($probePorts as $port => $type) {
                 $fp = @fsockopen($host, $port, $errno, $errstr, 1.5);
                 if ($fp) {
                     fclose($fp);
