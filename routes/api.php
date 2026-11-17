@@ -13,6 +13,7 @@ use Carbon\Carbon;
 
 use App\Http\Controllers\Api\CustomerController;
 use App\Http\Controllers\Api\ProductController;
+use App\Http\Controllers\Api\NetworkController;
 
 use App\Models\Invoice;
 use App\Models\Customer;
@@ -1511,6 +1512,19 @@ Route::post('/admin/customers/update', $handlerUpdateCustomer);
 
 Route::apiResource('customers', CustomerController::class);
 Route::apiResource('products', ProductController::class);
+
+// =========================================================================
+// MANAJEMEN JARINGAN & MULTI-ROUTER MIKROTIK (v6 / v7 / SIMULASI)
+// =========================================================================
+Route::get('/admin/routers', [NetworkController::class, 'index']);
+Route::post('/admin/routers', [NetworkController::class, 'store']);
+Route::post('/admin/routers/discover', [NetworkController::class, 'discover']);
+Route::match(['PUT', 'PATCH'], '/admin/routers/{id}', [NetworkController::class, 'update']);
+Route::delete('/admin/routers/{id}', [NetworkController::class, 'destroy']);
+Route::post('/admin/routers/{id}/test', [NetworkController::class, 'testConnection']);
+Route::get('/admin/routers/{id}/monitoring', [NetworkController::class, 'monitoring']);
+Route::post('/admin/routers/{id}/action', [NetworkController::class, 'action']);
+Route::get('/admin/network-logs', [NetworkController::class, 'logs']);
 
 // Tagihan Aktif
 Route::get('/customer/invoice/active', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice) {
