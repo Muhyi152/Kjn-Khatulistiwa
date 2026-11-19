@@ -910,11 +910,41 @@ Route::get('/mutasi', function (Request $r) use ($handlerMutasiAdmin, $handlerMu
 // =========================================================================
 // HANDLER NOTIFIKASI (TERHUBUNG LANGSUNG KE MYSQL `notifications`)
 // =========================================================================
-$formatNotifRow = function ($row) {
+$extractTicketMapFromRows = function ($rows) {
+    $ticketNumbers = [];
+    foreach ($rows as $row) {
+        $haystack = ($row->title ?? '') . ' ' . ($row->message ?? '');
+        if (preg_match_all('/TKT-[A-Za-z0-9_-]+/', $haystack, $matches)) {
+            foreach ($matches[0] as $tktNo) {
+                $ticketNumbers[] = $tktNo;
+            }
+        }
+    }
+    $ticketNumbers = array_values(array_unique($ticketNumbers));
+    if (empty($ticketNumbers) || !Schema::hasTable('tickets')) {
+        return collect([]);
+    }
+    return DB::table('tickets')
+        ->whereIn('nomor_tiket', $ticketNumbers)
+        ->get()
+        ->keyBy('nomor_tiket');
+};
+
+$formatNotifRow = function ($row, $ticketsMap = null) {
     $createdAt = $row->created_at
-        ? Carbon::parse($row->created_at)->toIso8601String()
-        : now()->toIso8601String();
+        ? Carbon::parse($row->created_at)->timezone('Asia/Jakarta')->toIso8601String()
+        : Carbon::now('Asia/Jakarta')->toIso8601String();
     $isRead = (bool) $row->is_read;
+
+    $nomorTiket = null;
+    $ticketObj = null;
+    $haystack = ($row->title ?? '') . ' ' . ($row->message ?? '');
+    if (preg_match('/TKT-[A-Za-z0-9_-]+/', $haystack, $m)) {
+        $nomorTiket = $m[0];
+        if ($ticketsMap && $ticketsMap->has($nomorTiket)) {
+            $ticketObj = $ticketsMap->get($nomorTiket);
+        }
+    }
 
     return [
         'id'              => (string) $row->id,
@@ -929,6 +959,9 @@ $formatNotifRow = function ($row) {
         'pesan'           => $row->message ?? '',
         'message'         => $row->message ?? '',
         'body'            => $row->message ?? '',
+        'nomor_tiket'     => $nomorTiket,
+        'status_tiket'    => $ticketObj ? strtoupper((string) $ticketObj->status) : null,
+        'kategori_tiket'  => $ticketObj ? (string) $ticketObj->kategori : null,
         'tanggal'         => $createdAt,
         'waktu'           => $createdAt,
         'created_at'      => $createdAt,
@@ -938,7 +971,7 @@ $formatNotifRow = function ($row) {
     ];
 };
 
-$handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $syncOldInvoicesIfEmpty) {
+$handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $extractTicketMapFromRows, $syncOldInvoicesIfEmpty) {
     try {
         $syncOldInvoicesIfEmpty();
 
@@ -948,7 +981,8 @@ $handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $
             ->limit(100)
             ->get();
 
-        $notifications = $rows->map($formatNotifRow)->values()->all();
+        $ticketsMap = $extractTicketMapFromRows($rows);
+        $notifications = $rows->map(fn($r) => $formatNotifRow($r, $ticketsMap))->values()->all();
         $unreadCount = $rows->where('is_read', 0)->count();
 
         return response()->json([
@@ -966,7 +1000,7 @@ $handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $
     }
 };
 
-$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $handlerAdminNotifications, $checkIsAdmin, $formatNotifRow, $syncOldInvoicesIfEmpty) {
+$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $handlerAdminNotifications, $checkIsAdmin, $formatNotifRow, $extractTicketMapFromRows, $syncOldInvoicesIfEmpty) {
     try {
         if ($checkIsAdmin($request)) {
             return $handlerAdminNotifications($request);
@@ -1000,7 +1034,8 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
             ->limit(100)
             ->get();
 
-        $notifications = $rows->map($formatNotifRow)->values()->all();
+        $ticketsMap = $extractTicketMapFromRows($rows);
+        $notifications = $rows->map(fn($r) => $formatNotifRow($r, $ticketsMap))->values()->all();
         $unreadCount = $rows->where('is_read', 0)->count();
 
         return response()->json([
