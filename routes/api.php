@@ -502,7 +502,7 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
 };
 
 // =========================================================================
-// HANDLER DASHBOARD ADMIN (AUTO-SYNC PRODUK & DISTRIBUSI TRANSAKSI RIIL)
+// HANDLER DASHBOARD ADMIN (AUTO-SYNC PRODUK, HARIAN & BULANAN RIIL WIB)
 // =========================================================================
 $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInvoice) {
     try {
@@ -608,12 +608,12 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
             $colorIdx++;
         }
 
-        // 5. Tren Pendapatan 6 Bulan Terakhir
-        $now = Carbon::now();
+        // 5. Tren Pendapatan 6 Bulan Terakhir (WIB)
+        $now = Carbon::now('Asia/Jakarta');
         $groupedByMonth = [];
 
         for ($i = 5; $i >= 0; $i--) {
-            $dateCursor = $now->copy()->subMonths($i);
+            $dateCursor = $now->copy()->startOfMonth()->subMonths($i);
             $ym = $dateCursor->format('Y-m');
             $mName = $dateCursor->format('M');
 
@@ -629,7 +629,7 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
 
         foreach ($paidInvoices as $inv) {
             $tgl = $inv->tanggal_bayar ?? $inv->created_at;
-            $carbon = $tgl ? Carbon::parse($tgl) : Carbon::now();
+            $carbon = $tgl ? Carbon::parse($tgl)->timezone('Asia/Jakarta') : $now->copy();
             $yearMonth = $carbon->format('Y-m');
 
             if (isset($groupedByMonth[$yearMonth])) {
@@ -643,6 +643,42 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
         ksort($groupedByMonth);
         $revenueMonthly = array_values($groupedByMonth);
 
+        // 6. Pendapatan Hari Ini & Grafik Harian (Senin - Minggu, Reset Otomatis Ganti Hari 00:00 WIB)
+        $todayStr = $now->toDateString();
+        $startOfWeek = $now->copy()->startOfWeek(Carbon::MONDAY)->startOfDay();
+        $labelHari = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'];
+        $harianMap = [];
+
+        for ($i = 0; $i < 7; $i++) {
+            $tglLoop = $startOfWeek->copy()->addDays($i)->toDateString();
+            $harianMap[$tglLoop] = [
+                'hari'    => $labelHari[$i],
+                'bulan'   => $labelHari[$i],
+                'tanggal' => $tglLoop,
+                'total'   => 0.0,
+            ];
+        }
+
+        $pendapatanHariIni = 0.0;
+
+        foreach ($paidInvoices as $inv) {
+            $tglRaw = $inv->tanggal_bayar ?? $inv->updated_at ?? $inv->created_at;
+            if (!$tglRaw) continue;
+
+            $carbonTgl = Carbon::parse($tglRaw)->timezone('Asia/Jakarta');
+            $tglStr = $carbonTgl->toDateString();
+            $nominal = (double) $inv->total_tagihan;
+
+            if ($tglStr === $todayStr) {
+                $pendapatanHariIni += $nominal;
+            }
+            if (isset($harianMap[$tglStr])) {
+                $harianMap[$tglStr]['total'] += $nominal;
+            }
+        }
+
+        $grafikHarian = array_values($harianMap);
+
         $statsData = [
             'total_customers'         => $totalCustomers,
             'totalCustomers'          => $totalCustomers,
@@ -651,6 +687,8 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
             'isolated_pending'        => $isolatedCustomers,
             'monthly_revenue'         => $monthlyRevenue,
             'monthlyRevenue'          => $monthlyRevenue,
+            'pendapatan_hari_ini'     => $pendapatanHariIni,
+            'grafik_harian'           => $grafikHarian,
             'paid_invoices'           => $paidCount,
             'pending_invoices'        => $pendingCount,
             'total_products'          => $totalProductsCount,
@@ -714,6 +752,14 @@ $handlerMutasiAdmin = function (Request $request) use ($resolveProductFromInvoic
             }
             $namaProdukBersih = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $namaProduk);
 
+            $tglBayarRaw = $inv->tanggal_bayar ?? $inv->created_at;
+            $tglBayarIso = $tglBayarRaw
+                ? Carbon::parse($tglBayarRaw)->timezone('Asia/Jakarta')->toIso8601String()
+                : '';
+            $createdAtIso = $inv->created_at
+                ? Carbon::parse($inv->created_at)->timezone('Asia/Jakarta')->toIso8601String()
+                : '';
+
             $list[] = [
                 'id'                 => (int) $inv->id,
                 'nomor_invoice'      => (string) $inv->nomor_invoice,
@@ -726,8 +772,8 @@ $handlerMutasiAdmin = function (Request $request) use ($resolveProductFromInvoic
                 'status'             => $isPaid ? 'PAID' : strtoupper($inv->status),
                 'is_paid'            => $isPaid,
                 'metode_pembayaran'  => $inv->metode_pembayaran ?? 'Xendit Multi Payment',
-                'tanggal_bayar'      => (string) ($inv->tanggal_bayar ?? $inv->created_at),
-                'created_at'         => (string) $inv->created_at,
+                'tanggal_bayar'      => $tglBayarIso,
+                'created_at'         => $createdAtIso,
             ];
         }
 
@@ -796,6 +842,14 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
             }
             $namaProdukBersih = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawProduk);
 
+            $tglBayarRaw = $inv->tanggal_bayar ?? $inv->created_at;
+            $tglBayarIso = $tglBayarRaw
+                ? Carbon::parse($tglBayarRaw)->timezone('Asia/Jakarta')->toIso8601String()
+                : '';
+            $createdAtIso = $inv->created_at
+                ? Carbon::parse($inv->created_at)->timezone('Asia/Jakarta')->toIso8601String()
+                : '';
+
             $list[] = [
                 'id'                 => (int) $inv->id,
                 'nomor_invoice'      => (string) $inv->nomor_invoice,
@@ -808,8 +862,8 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
                 'status'             => strtoupper($inv->status),
                 'is_paid'            => $isPaid,
                 'metode_pembayaran'  => $inv->metode_pembayaran ?? 'Xendit Multi Payment',
-                'tanggal_bayar'      => (string) ($inv->tanggal_bayar ?? $inv->created_at),
-                'created_at'         => (string) $inv->created_at,
+                'tanggal_bayar'      => $tglBayarIso,
+                'created_at'         => $createdAtIso,
             ];
         }
 
@@ -1780,11 +1834,18 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
         if ($isPaid) {
             $baruSajaLunas = !$alreadyPaid;
 
+            // Update langsung via DB::table agar tanggal_bayar pasti tersimpan walau tidak di $fillable
             if (!$alreadyPaid || empty($invoice->tanggal_bayar)) {
-                $invoice->update([
-                    'status'        => 'PAID',
-                    'tanggal_bayar' => $invoice->tanggal_bayar ?? now(),
-                ]);
+                $nowWib = Carbon::now('Asia/Jakarta');
+                $updateInv = ['status' => 'PAID'];
+                if (Schema::hasColumn('invoices', 'tanggal_bayar')) {
+                    $updateInv['tanggal_bayar'] = $invoice->tanggal_bayar ?? $nowWib;
+                }
+                if (Schema::hasColumn('invoices', 'updated_at')) {
+                    $updateInv['updated_at'] = $nowWib;
+                }
+                DB::table('invoices')->where('id', $invoice->id)->update($updateInv);
+                $invoice = Invoice::find($invoice->id) ?? $invoice;
             }
 
             $customer = Customer::find($invoice->customer_id) ?? $resolveCustomer($invoice->customer_id);
