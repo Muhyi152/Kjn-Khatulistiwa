@@ -18,6 +18,8 @@ use App\Http\Controllers\Api\NetworkController;
 use App\Http\Middleware\EnsureAuthenticated;
 use App\Http\Middleware\EnsureAdmin;
 
+use Illuminate\Support\Facades\Cache;
+
 use App\Models\Invoice;
 use App\Models\Customer;
 use App\Models\User;
@@ -2015,6 +2017,262 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
     }
 })->middleware('throttle:15,1');
 
+
+// =========================================================================
+// OTP WHATSAPP VIA FONNTE (AMAN DI BACKEND + ANTI BRUTE-FORCE)
+// =========================================================================
+Route::post('/otp/request', function (Request $request) use ($safeErrorMessage) {
+    try {
+        $rawPhone = (string) ($request->input('phone') ?? $request->input('no_hp') ?? '');
+        $digits = preg_replace('/[^0-9]/', '', $rawPhone);
+        if (str_starts_with($digits, '0')) {
+            $phone = '62' . substr($digits, 1);
+        } elseif (str_starts_with($digits, '8')) {
+            $phone = '62' . $digits;
+        } else {
+            $phone = $digits;
+        }
+
+        if (strlen($phone) < 10 || strlen($phone) > 15) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Nomor WhatsApp tidak valid.',
+            ], 422);
+        }
+
+        $fonnteToken = trim((string) (config('services.fonnte.token') ?: env('FONNTE_TOKEN', '')));
+        if ($fonnteToken === '') {
+            Log::error('FONNTE_TOKEN belum dikonfigurasi di server.');
+            return response()->json([
+                'success' => false,
+                'message' => 'Layanan WhatsApp OTP belum dikonfigurasi di server.',
+            ], 500);
+        }
+
+        $cooldownKey = "otp_cooldown:{$phone}";
+        if (Cache::has($cooldownKey)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tunggu 1 menit sebelum meminta kode OTP baru.',
+            ], 429);
+        }
+
+        $kodeOtp = (string) random_int(100000, 999999);
+        $otpKey  = "otp_login:{$phone}";
+
+        Cache::put($otpKey, [
+            'hash'     => Hash::make($kodeOtp),
+            'attempts' => 0,
+        ], now()->addMinutes(5));
+        Cache::put($cooldownKey, true, now()->addSeconds(60));
+
+        $pesan = "*KJN Khatulistiwa - Billing System*\n\n"
+            . "Kode verifikasi (OTP) login Anda adalah:\n\n"
+            . "👉 *{$kodeOtp}*\n\n"
+            . "Kode ini hanya berlaku selama 5 menit. Jangan berikan kode ini kepada siapa pun.";
+
+        $res = Http::withHeaders([
+            'Authorization' => $fonnteToken,
+        ])->asForm()->timeout(10)->post('https://api.fonnte.com/send', [
+            'target'      => $phone,
+            'message'     => $pesan,
+            'countryCode' => '62',
+        ]);
+
+        $resJson = $res->json();
+        if (!$res->successful() || empty($resJson['status'])) {
+            Cache::forget($otpKey);
+            Cache::forget($cooldownKey);
+            Log::warning('Fonnte OTP gagal: ' . $res->body());
+            return response()->json([
+                'success' => false,
+                'message' => $resJson['reason'] ?? 'Gagal mengirim OTP. Pastikan WhatsApp Gateway aktif.',
+            ], 400);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Kode OTP berhasil dikirim ke WhatsApp Anda.',
+        ], 200);
+    } catch (\Throwable $e) {
+        Log::error('Error /otp/request: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Gagal menghubungi layanan OTP: ' . $safeErrorMessage($e),
+        ], 500);
+    }
+})->middleware('throttle:5,1');
+
+Route::post('/otp/verify', function (Request $request) use ($createNotification, $safeErrorMessage) {
+    try {
+        $rawPhone = (string) ($request->input('phone') ?? $request->input('no_hp') ?? '');
+        $kodeOtp  = trim((string) ($request->input('otp') ?? $request->input('kode_otp') ?? ''));
+
+        $digits = preg_replace('/[^0-9]/', '', $rawPhone);
+        if (str_starts_with($digits, '0')) {
+            $phone = '62' . substr($digits, 1);
+        } elseif (str_starts_with($digits, '8')) {
+            $phone = '62' . $digits;
+        } else {
+            $phone = $digits;
+        }
+
+        if (strlen($phone) < 10 || !preg_match('/^\d{6}$/', $kodeOtp)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Nomor WhatsApp dan 6 digit kode OTP wajib diisi dengan benar.',
+            ], 422);
+        }
+
+        $otpKey = "otp_login:{$phone}";
+        $cached = Cache::get($otpKey);
+
+        if (!is_array($cached) || empty($cached['hash'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Kode OTP telah kedaluwarsa. Silakan minta kode baru.',
+            ], 422);
+        }
+
+        $attempts = (int) ($cached['attempts'] ?? 0) + 1;
+        if ($attempts > 5) {
+            Cache::forget($otpKey);
+            return response()->json([
+                'success' => false,
+                'message' => 'Terlalu banyak percobaan OTP salah. Silakan minta kode baru.',
+            ], 429);
+        }
+
+        if (!Hash::check($kodeOtp, $cached['hash'])) {
+            $cached['attempts'] = $attempts;
+            Cache::put($otpKey, $cached, now()->addMinutes(5));
+            return response()->json([
+                'success' => false,
+                'message' => 'Kode OTP yang Anda masukkan salah!',
+            ], 422);
+        }
+
+        Cache::forget($otpKey);
+        Cache::forget("otp_cooldown:{$phone}");
+
+        // Cari customer berdasarkan variasi format nomor HP (628..., 08..., +628...)
+        $localZero  = str_starts_with($phone, '62') ? '0' . substr($phone, 2) : $phone;
+        $plus62     = '+' . $phone;
+        $candidates = array_values(array_unique([$phone, $localZero, $plus62]));
+
+        $customer = Customer::where(function ($q) use ($candidates) {
+            $first = true;
+            foreach (['no_wa', 'no_hp', 'phone'] as $col) {
+                if (Schema::hasColumn('customers', $col)) {
+                    if ($first) {
+                        $q->whereIn($col, $candidates);
+                        $first = false;
+                    } else {
+                        $q->orWhereIn($col, $candidates);
+                    }
+                }
+            }
+        })->first();
+
+        $user = null;
+        if ($customer) {
+            if (!empty($customer->user_id)) {
+                $user = User::find($customer->user_id);
+            }
+            if (!$user && !empty($customer->email)) {
+                $user = User::where('email', $customer->email)->first();
+            }
+        }
+
+        $fallbackEmail = "wa.{$phone}@kjn.local";
+        if (!$user) {
+            $user = User::where('email', $fallbackEmail)->first();
+        }
+
+        if (!$user) {
+            $result = DB::transaction(function () use ($customer, $phone, $fallbackEmail) {
+                $namaBaru = $customer
+                    ? ($customer->nama ?? $customer->name ?? "Pelanggan ({$phone})")
+                    : "Pelanggan ({$phone})";
+
+                $newUser = new User([
+                    'name'     => $namaBaru,
+                    'email'    => $fallbackEmail,
+                    'password' => bcrypt(Str::random(24)),
+                ]);
+                $newUser->role = 'customer';
+                $newUser->email_verified_at = now();
+                $newUser->save();
+
+                if ($customer) {
+                    if (Schema::hasColumn('customers', 'user_id') && empty($customer->user_id)) {
+                        DB::table('customers')->where('id', $customer->id)->update([
+                            'user_id'    => $newUser->id,
+                            'updated_at' => now(),
+                        ]);
+                        $customer = Customer::find($customer->id);
+                    }
+                } else {
+                    $customerData = [];
+                    if (Schema::hasColumn('customers', 'nama')) $customerData['nama'] = $namaBaru;
+                    elseif (Schema::hasColumn('customers', 'name')) $customerData['name'] = $namaBaru;
+                    if (Schema::hasColumn('customers', 'user_id')) $customerData['user_id'] = $newUser->id;
+                    if (Schema::hasColumn('customers', 'email')) $customerData['email'] = $fallbackEmail;
+                    if (Schema::hasColumn('customers', 'no_wa')) $customerData['no_wa'] = $phone;
+                    if (Schema::hasColumn('customers', 'no_hp')) $customerData['no_hp'] = $phone;
+                    if (Schema::hasColumn('customers', 'status')) $customerData['status'] = 'INACTIVE';
+                    if (Schema::hasColumn('customers', 'status_koneksi')) $customerData['status_koneksi'] = 'Offline';
+                    if (Schema::hasColumn('customers', 'nama_paket')) $customerData['nama_paket'] = null;
+                    if (Schema::hasColumn('customers', 'product_id')) {
+                        $defaultProd = Product::first();
+                        $customerData['product_id'] = $defaultProd ? $defaultProd->id : 1;
+                    }
+                    $customer = Customer::create($customerData);
+                }
+
+                return ['user' => $newUser, 'customer' => $customer];
+            });
+
+            $user     = $result['user'];
+            $customer = $result['customer'];
+
+            $createNotification(
+                $user->id,
+                'customer',
+                'Selamat Datang di Portal Pelanggan',
+                "Halo {$user->name}, akun WhatsApp Anda berhasil terdaftar. Silakan pilih paket internet untuk mulai berlangganan.",
+                'INFO'
+            );
+        }
+
+        if (!method_exists($user, 'createToken')) {
+            return response()->json(['success' => false, 'message' => 'Konfigurasi autentikasi server belum lengkap.'], 500);
+        }
+
+        $token = $user->createToken('auth_token')->plainTextToken;
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Verifikasi OTP berhasil!',
+            'token'   => $token,
+            'user'    => [
+                'id'          => $user->id,
+                'customer_id' => $customer ? $customer->id : $user->id,
+                'name'        => $user->name,
+                'email'       => $user->email,
+                'phone'       => $customer->no_wa ?? $customer->no_hp ?? $phone,
+                'role'        => $user->role ?? 'customer',
+            ],
+        ], 200);
+    } catch (\Throwable $e) {
+        Log::error('Error /otp/verify: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Gagal verifikasi OTP: ' . $safeErrorMessage($e),
+        ], 500);
+    }
+})->middleware('throttle:10,1');
+
 // =========================================================================
 // ROUTE TERPROTEKSI (WAJIB LOGIN DENGAN BEARER TOKEN)
 // =========================================================================
@@ -2247,6 +2505,7 @@ Route::middleware([EnsureAuthenticated::class])->group(function () use (
         return $formatCustomerProfile($ownCustomer, $request);
     });
 
+    Route::post('/customer/change-password', [CustomerController::class, 'gantiPassword'])->middleware('throttle:5,1');
     Route::post('/customer/profile/update', function (Request $request) use ($resolveCustomer, $safeErrorMessage) {
         try {
             $customer = $resolveCustomer($request);
