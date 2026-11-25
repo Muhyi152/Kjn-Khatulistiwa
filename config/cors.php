@@ -37,6 +37,8 @@ return [
         'Accept',
         'Origin',
         'X-XSRF-TOKEN',
+        'Cache-Control',
+        'Pragma',
     ],
 
     'exposed_headers' => [],
