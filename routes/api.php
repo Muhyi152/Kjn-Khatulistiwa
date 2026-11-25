@@ -2040,8 +2040,8 @@ Route::post('/login', function (Request $request) {
     }
 });
 
-// =========================================================================
-// LUPA PASSWORD (CARI USERNAME / PPPOE / EMAIL -> KIRIM PASSWORD KE GMAIL)
+/// =========================================================================
+// LUPA PASSWORD (CARI USERNAME / PPPOE / EMAIL -> KIRIM PASSWORD VIA BREVO API)
 // =========================================================================
 Route::post('/forgot-password', function (Request $request) {
     try {
@@ -2166,11 +2166,13 @@ Route::post('/forgot-password', function (Request $request) {
             ], 422);
         }
 
-        // Cek apakah mailer server masih mode log/array (SMTP belum disetting)
-        if (in_array(config('mail.default'), ['log', 'array'], true)) {
+        $brevoApiKey = trim((string) env('BREVO_API_KEY', ''));
+
+        // Jika BREVO_API_KEY belum disetting, cek apakah SMTP biasa aktif
+        if ($brevoApiKey === '' && in_array(config('mail.default'), ['log', 'array'], true)) {
             return response()->json([
                 'success' => false,
-                'message' => 'Layanan email SMTP di server Railway belum dikonfigurasi (MAIL_MAILER masih ' . config('mail.default') . ').',
+                'message' => 'Layanan email server belum dikonfigurasi (tambahkan BREVO_API_KEY di Variables Railway).',
             ], 500);
         }
 
@@ -2179,6 +2181,15 @@ Route::post('/forgot-password', function (Request $request) {
         $passwordBaru = '';
         for ($i = 0; $i < 8; $i++) {
             $passwordBaru .= $karakter[random_int(0, strlen($karakter) - 1)];
+        }
+
+        $fromEmail = trim((string) env('MAIL_FROM_ADDRESS', ''));
+        if ($fromEmail === '' || $fromEmail === 'hello@example.com') {
+            $fromEmail = 'kjnkhatulistiwa@gmail.com';
+        }
+        $fromName = trim((string) env('MAIL_FROM_NAME', 'BUMDES Khatulistiwa'));
+        if ($fromName === '' || str_contains($fromName, '${')) {
+            $fromName = 'BUMDES Khatulistiwa';
         }
 
         // Gunakan transaction: password hanya tersimpan jika email benar-benar terkirim
@@ -2198,10 +2209,36 @@ Route::post('/forgot-password', function (Request $request) {
                 . "Silakan gunakan password baru di atas untuk masuk ke aplikasi, lalu segera ganti password Anda jika diperlukan.\n\n"
                 . "Terima kasih,\nNusantara Teknologi - Billing System";
 
-            Mail::raw($isiPesan, function ($mail) use ($targetEmail) {
-                $mail->to($targetEmail)
-                    ->subject('Password Baru Akun - BUMDES Khatulistiwa Billing');
-            });
+            if ($brevoApiKey !== '') {
+                $mailResponse = Http::withHeaders([
+                    'api-key'      => $brevoApiKey,
+                    'accept'       => 'application/json',
+                    'content-type' => 'application/json',
+                ])->timeout(10)->post('https://api.brevo.com/v3/smtp/email', [
+                    'sender' => [
+                        'name'  => $fromName,
+                        'email' => $fromEmail,
+                    ],
+                    'to' => [
+                        [
+                            'email' => $targetEmail,
+                            'name'  => !empty($user->name) ? $user->name : 'Pelanggan',
+                        ],
+                    ],
+                    'subject'     => 'Password Baru Akun - BUMDES Khatulistiwa Billing',
+                    'textContent' => $isiPesan,
+                ]);
+
+                if (!$mailResponse->successful()) {
+                    $errDetail = $mailResponse->json('message') ?? $mailResponse->body();
+                    throw new \RuntimeException('Brevo API error (' . $mailResponse->status() . '): ' . $errDetail);
+                }
+            } else {
+                Mail::raw($isiPesan, function ($mail) use ($targetEmail) {
+                    $mail->to($targetEmail)
+                        ->subject('Password Baru Akun - BUMDES Khatulistiwa Billing');
+                });
+            }
 
             DB::commit();
         } catch (\Throwable $mailErr) {
@@ -2210,11 +2247,11 @@ Route::post('/forgot-password', function (Request $request) {
 
             return response()->json([
                 'success' => false,
-                'message' => 'Gagal mengirim email ke pengguna. Periksa konfigurasi SMTP di server.',
+                'message' => 'Gagal mengirim email ke pengguna: ' . $mailErr->getMessage(),
             ], 500);
         }
 
-        // Sensor alamat email di response untuk keamanan (contoh: ro***@gmail.com)
+        // Sensor alamat email di response untuk keamanan (contoh: nu***@gmail.com)
         [$local, $domain] = array_pad(explode('@', $targetEmail, 2), 2, '');
         $maskedLocal = strlen($local) > 2
             ? substr($local, 0, 2) . str_repeat('*', max(3, strlen($local) - 2))
