@@ -2405,7 +2405,6 @@ Route::post('/register', function (Request $request) use ($createNotification) {
     }
 });
 
-
 // =========================================================================
 // LOGIN / DAFTAR CEPAT VIA GOOGLE (AUTO-REGISTER JIKA USER BARU)
 // =========================================================================
@@ -2425,6 +2424,7 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
         ]);
 
         if (!$googleRes->successful()) {
+            Log::warning('Google tokeninfo gagal: ' . $googleRes->body());
             return response()->json([
                 'success' => false,
                 'message' => 'Token Google tidak valid atau sudah kedaluwarsa.',
@@ -2435,6 +2435,7 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
         $expectedClientId = '239418401389-olhf9hrkv5rm246pkee3gpl1me0b1uci.apps.googleusercontent.com';
 
         if (($gData['aud'] ?? '') !== $expectedClientId) {
+            Log::warning('Google aud mismatch', ['aud' => $gData['aud'] ?? null]);
             return response()->json([
                 'success' => false,
                 'message' => 'Client ID Google tidak cocok dengan aplikasi ini.',
@@ -2469,7 +2470,7 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
         $userBaru = false;
 
         if (!$user) {
-            // USER BARU -> Otomatis daftarkan ke tabel users & customers
+            // USER BARU -> Otomatis daftarkan ke tabel users & hubungkan/buat customers
             $userBaru = true;
             $result = DB::transaction(function () use ($nama, $email) {
                 $userData = [
@@ -2485,25 +2486,41 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
 
                 $newUser = User::create($userData);
 
-                $customerData = [];
-                if (Schema::hasColumn('customers', 'nama')) {
-                    $customerData['nama'] = $newUser->name;
-                } elseif (Schema::hasColumn('customers', 'name')) {
-                    $customerData['name'] = $newUser->name;
-                }
-                if (Schema::hasColumn('customers', 'user_id')) $customerData['user_id'] = $newUser->id;
-                if (Schema::hasColumn('customers', 'email')) $customerData['email'] = $newUser->email;
-                if (Schema::hasColumn('customers', 'no_wa')) $customerData['no_wa'] = '';
-                if (Schema::hasColumn('customers', 'no_hp')) $customerData['no_hp'] = '';
-                if (Schema::hasColumn('customers', 'status')) $customerData['status'] = 'INACTIVE';
-                if (Schema::hasColumn('customers', 'status_koneksi')) $customerData['status_koneksi'] = 'Offline';
-                if (Schema::hasColumn('customers', 'nama_paket')) $customerData['nama_paket'] = null;
-                if (Schema::hasColumn('customers', 'product_id')) {
-                    $defaultProd = Product::first();
-                    $customerData['product_id'] = $defaultProd ? $defaultProd->id : 1;
+                // Cek dulu apakah data customer dengan email ini sudah pernah dibuat oleh Admin
+                $existingCustomer = null;
+                if (Schema::hasColumn('customers', 'email')) {
+                    $existingCustomer = Customer::whereRaw('LOWER(email) = ?', [$email])->first();
                 }
 
-                $newCustomer = Customer::create($customerData);
+                if ($existingCustomer) {
+                    if (Schema::hasColumn('customers', 'user_id') && empty($existingCustomer->user_id)) {
+                        DB::table('customers')
+                            ->where('id', $existingCustomer->id)
+                            ->update(['user_id' => $newUser->id, 'updated_at' => now()]);
+                        $existingCustomer = Customer::find($existingCustomer->id);
+                    }
+                    $newCustomer = $existingCustomer;
+                } else {
+                    $customerData = [];
+                    if (Schema::hasColumn('customers', 'nama')) {
+                        $customerData['nama'] = $newUser->name;
+                    } elseif (Schema::hasColumn('customers', 'name')) {
+                        $customerData['name'] = $newUser->name;
+                    }
+                    if (Schema::hasColumn('customers', 'user_id')) $customerData['user_id'] = $newUser->id;
+                    if (Schema::hasColumn('customers', 'email')) $customerData['email'] = $newUser->email;
+                    if (Schema::hasColumn('customers', 'no_wa')) $customerData['no_wa'] = '';
+                    if (Schema::hasColumn('customers', 'no_hp')) $customerData['no_hp'] = '';
+                    if (Schema::hasColumn('customers', 'status')) $customerData['status'] = 'INACTIVE';
+                    if (Schema::hasColumn('customers', 'status_koneksi')) $customerData['status_koneksi'] = 'Offline';
+                    if (Schema::hasColumn('customers', 'nama_paket')) $customerData['nama_paket'] = null;
+                    if (Schema::hasColumn('customers', 'product_id')) {
+                        $defaultProd = Product::first();
+                        $customerData['product_id'] = $defaultProd ? $defaultProd->id : 1;
+                    }
+
+                    $newCustomer = Customer::create($customerData);
+                }
 
                 return ['user' => $newUser, 'customer' => $newCustomer];
             });
@@ -2564,6 +2581,7 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
             ],
         ], 200);
     } catch (\Throwable $e) {
+        Log::error('Gagal /google-login: ' . $e->getMessage());
         return response()->json([
             'success' => false,
             'message' => 'Gagal login Google: ' . $e->getMessage(),
