@@ -12,7 +12,7 @@ use Illuminate\Support\Facades\Crypt;
 
 class NetworkController extends Controller
 {
-    private const ALLOWED_CONN_TYPES = ['simulasi', 'api_v6', 'api_ssl', 'rest_v7', 'ssh'];
+    private const ALLOWED_CONN_TYPES = ['api_v6', 'api_ssl', 'rest_v7', 'ssh'];
     private const ALLOWED_AUTH_MODES = ['campuran', 'pppoe', 'hotspot', 'dhcp', 'radius', 'ipoe'];
 
     public function __construct(private MikrotikService $mikrotik)
@@ -26,17 +26,17 @@ class NetworkController extends Controller
                 $table->id();
                 $table->string('name');
                 $table->string('location')->nullable();
-                $table->string('ip_host')->default('192.168.88.1');
+                $table->string('ip_host');
                 $table->integer('port')->default(8728);
                 $table->string('username')->default('admin');
                 $table->text('password_encrypted')->nullable();
-                $table->string('connection_type', 30)->default('simulasi'); // simulasi | api_v6 | api_ssl | rest_v7 | ssh
-                $table->string('auth_mode', 30)->default('campuran');       // campuran | pppoe | hotspot | dhcp | radius | ipoe
+                $table->string('connection_type', 30)->default('api_v6'); // api_v6 | api_ssl | rest_v7 | ssh
+                $table->string('auth_mode', 30)->default('pppoe');        // campuran | pppoe | hotspot | dhcp | radius | ipoe
                 $table->string('model')->nullable();
                 $table->string('os_version')->nullable();
                 $table->string('cpu_info')->nullable();
                 $table->string('memory_info')->nullable();
-                $table->boolean('is_online')->default(true);
+                $table->boolean('is_online')->default(false);
                 $table->longText('meta_json')->nullable();
                 $table->timestamps();
             });
@@ -56,99 +56,10 @@ class NetworkController extends Controller
             });
         }
 
-        // Seed 2 router awal agar menu Multi-Router langsung siap didemokan sebelum klien memberi IP asli
-        if (DB::table('routers')->count() === 0) {
-            $pppoeFromDb = [];
-            $queuesFromDb = [];
-            try {
-                $customers = Customer::orderBy('id', 'asc')->limit(10)->get();
-                foreach ($customers as $idx => $c) {
-                    $u = trim((string) ($c->pppoe_username ?? $c->username_pppoe ?? ''));
-                    if ($u === '' || $u === '-') {
-                        $u = strtolower(explode(' ', trim($c->nama ?? 'user' . $c->id))[0]) . '@kjn';
-                    }
-                    $isActive = !in_array(strtoupper($c->status ?? 'ACTIVE'), ['ISOLIR', 'INACTIVE']);
-                    $ip = '10.10.10.' . (10 + $idx);
-                    $pppoeFromDb[] = [
-                        'id'       => (string) $c->id,
-                        'username' => $u,
-                        'service'  => 'pppoe',
-                        'profile'  => $c->nama_paket ?? 'Standard',
-                        'ip'       => $ip,
-                        'uptime'   => $isActive ? (($idx + 1) . 'd 4h') : '-',
-                        'online'   => $isActive,
-                        'disabled' => !$isActive,
-                    ];
-                    $queuesFromDb[] = [
-                        'id'        => 'q' . $c->id,
-                        'name'      => $u,
-                        'target'    => $ip . '/32',
-                        'max_limit' => '50M/50M',
-                        'disabled'  => false,
-                    ];
-                }
-            } catch (\Throwable $e) {}
-
-            $metaPusat = [
-                'online'           => true,
-                'internet_enabled' => true,
-                'cpu_load'         => 22,
-                'uptime'           => '12d 4h 32m',
-                'bandwidth_in'     => 12.5,
-                'bandwidth_out'    => 18.7,
-                'blocked_sites'    => ['situsjudi-contoh.com'],
-            ];
-            if (!empty($pppoeFromDb)) {
-                $metaPusat['pppoe_users'] = $pppoeFromDb;
-                $metaPusat['queues']      = $queuesFromDb;
-            }
-
-            DB::table('routers')->insert([
-                [
-                    'name'               => 'MikroTik RB750Gr3 (Pusat)',
-                    'location'           => 'Server Pusat',
-                    'ip_host'            => '192.168.88.1',
-                    'port'               => 8728,
-                    'username'           => 'admin',
-                    'password_encrypted' => $this->encryptPassword(''),
-                    'connection_type'    => 'simulasi',
-                    'auth_mode'          => 'campuran',
-                    'model'              => 'RB750Gr3',
-                    'os_version'         => '7.16.1 (stable)',
-                    'cpu_info'           => '1 Core, 1000 MHz',
-                    'memory_info'        => '64 MB',
-                    'is_online'          => 1,
-                    'meta_json'          => json_encode($metaPusat),
-                    'created_at'         => now(),
-                    'updated_at'         => now(),
-                ],
-                [
-                    'name'               => 'MikroTik CCR1009 (Cabang A)',
-                    'location'           => 'POP Cabang A',
-                    'ip_host'            => '192.168.89.1',
-                    'port'               => 8728,
-                    'username'           => 'admin',
-                    'password_encrypted' => $this->encryptPassword(''),
-                    'connection_type'    => 'simulasi',
-                    'auth_mode'          => 'pppoe',
-                    'model'              => 'CCR1009-7G-1C',
-                    'os_version'         => '7.15.3 (stable)',
-                    'cpu_info'           => '9 Core, 1200 MHz',
-                    'memory_info'        => '2048 MB',
-                    'is_online'          => 1,
-                    'meta_json'          => json_encode([
-                        'online'           => true,
-                        'internet_enabled' => true,
-                        'cpu_load'         => 18,
-                        'uptime'           => '24d 11h 05m',
-                        'bandwidth_in'     => 42.3,
-                        'bandwidth_out'    => 64.1,
-                    ]),
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ],
-            ]);
-        }
+        // Bersihkan router simulasi lama dari database agar hanya tersisa router real
+        try {
+            DB::table('routers')->where('connection_type', 'simulasi')->delete();
+        } catch (\Throwable $e) {}
     }
 
     private function defaultPortForType(string $connType): int
@@ -204,7 +115,7 @@ class NetworkController extends Controller
     }
 
     /**
-     * GET /api/admin/routers -> Daftar Multi-Router + Ringkasan Global
+     * GET /api/admin/routers -> Daftar Multi-Router + Ringkasan Global (REAL ONLY)
      */
     public function index()
     {
@@ -221,23 +132,39 @@ class NetworkController extends Controller
             $arr = $this->routerRowToArray($row);
             $meta = json_decode($row->meta_json ?? '{}', true) ?: [];
 
-            $isOnline = (bool) $row->is_online;
+            $isOnline = false;
+            $internetEnabled = false;
             $activeUsers = 0;
             $bwIn = 0.0;
             $bwOut = 0.0;
-            $uptime = $meta['uptime'] ?? '12d 4h 32m';
-            $cpuLoad = (int) ($meta['cpu_load'] ?? 20);
+            $uptime = '-';
+            $cpuLoad = 0;
 
             try {
                 $mon = $this->mikrotik->getMonitoringData($arr);
-                $isOnline = (bool) ($mon['router_info']['online'] ?? true);
+                $isOnline = (bool) ($mon['router_info']['online'] ?? false);
+                $internetEnabled = (bool) ($mon['internet_enabled'] ?? $isOnline);
                 $activeUsers = (int) ($mon['active_users'] ?? 0);
                 $bwIn = (float) ($mon['bandwidth_in'] ?? 0);
                 $bwOut = (float) ($mon['bandwidth_out'] ?? 0);
-                $uptime = $mon['router_info']['uptime'] ?? $uptime;
-                $cpuLoad = (int) ($mon['router_info']['cpu_load'] ?? $cpuLoad);
+                $uptime = $mon['router_info']['uptime'] ?? '-';
+                $cpuLoad = (int) ($mon['router_info']['cpu_load'] ?? 0);
+
+                if ((bool) $row->is_online !== $isOnline) {
+                    DB::table('routers')->where('id', $row->id)->update([
+                        'is_online'  => $isOnline ? 1 : 0,
+                        'updated_at' => now(),
+                    ]);
+                }
             } catch (\Throwable $e) {
-                $isOnline = $row->connection_type === 'simulasi';
+                $isOnline = false;
+                $internetEnabled = false;
+                if ((bool) $row->is_online) {
+                    DB::table('routers')->where('id', $row->id)->update([
+                        'is_online'  => 0,
+                        'updated_at' => now(),
+                    ]);
+                }
             }
 
             if ($isOnline) $onlineCount++;
@@ -259,7 +186,7 @@ class NetworkController extends Controller
                 'cpu_info'         => $row->cpu_info ?? '-',
                 'memory_info'      => $row->memory_info ?? '-',
                 'is_online'        => $isOnline,
-                'internet_enabled' => (bool) ($meta['internet_enabled'] ?? true),
+                'internet_enabled' => $internetEnabled,
                 'uptime'           => $uptime,
                 'cpu_load'         => $cpuLoad,
                 'active_users'     => $activeUsers,
@@ -283,18 +210,23 @@ class NetworkController extends Controller
     }
 
     /**
-     * POST /api/admin/routers -> Tambah Router Baru
+     * POST /api/admin/routers -> Tambah Router Baru (REAL ONLY)
      */
     public function store(Request $request)
     {
         $this->ensureTables();
 
         $name = trim((string) $request->input('name', ''));
-        if ($name === '') {
-            return response()->json(['success' => false, 'message' => 'Nama router wajib diisi.'], 422);
+        $ipHost = trim((string) $request->input('ip_host', ''));
+
+        if ($name === '' || $ipHost === '') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Nama router dan IP Publik / DDNS wajib diisi.',
+            ], 422);
         }
 
-        $connTypeInput = strtolower(trim((string) $request->input('connection_type', 'simulasi')));
+        $connTypeInput = strtolower(trim((string) $request->input('connection_type', 'api_v6')));
         if (!in_array($connTypeInput, self::ALLOWED_CONN_TYPES, true)) {
             return response()->json([
                 'success' => false,
@@ -302,48 +234,88 @@ class NetworkController extends Controller
             ], 422);
         }
 
-        $authModeInput = strtolower(trim((string) $request->input('auth_mode', 'campuran')));
+        $authModeInput = strtolower(trim((string) $request->input('auth_mode', 'pppoe')));
         if (!in_array($authModeInput, self::ALLOWED_AUTH_MODES, true)) {
-            $authModeInput = 'campuran';
+            $authModeInput = 'pppoe';
         }
 
         $port = (int) ($request->input('port') ?: $this->defaultPortForType($connTypeInput));
+        $username = trim((string) $request->input('username', 'admin'));
+        $passwordPlain = (string) $request->input('password', '');
 
         $payload = [
             'name'               => $name,
-            'location'           => trim((string) $request->input('location', 'Cabang')),
-            'ip_host'            => trim((string) $request->input('ip_host', '192.168.88.1')),
+            'location'           => trim((string) $request->input('location', 'Pusat')),
+            'ip_host'            => $ipHost,
             'port'               => $port,
-            'username'           => trim((string) $request->input('username', 'admin')),
-            'password_encrypted' => $this->encryptPassword((string) $request->input('password', '')),
+            'username'           => $username,
+            'password_encrypted' => $this->encryptPassword($passwordPlain),
             'connection_type'    => $connTypeInput,
             'auth_mode'          => $authModeInput,
             'model'              => $request->input('model', 'MikroTik'),
-            'os_version'         => $request->input('os_version', '7.x'),
-            'cpu_info'           => $request->input('cpu_info', '1 Core'),
-            'memory_info'        => $request->input('memory_info', '64 MB'),
-            'is_online'          => 1,
+            'os_version'         => $request->input('os_version', '-'),
+            'cpu_info'           => $request->input('cpu_info', '-'),
+            'memory_info'        => $request->input('memory_info', '-'),
+            'is_online'          => 0,
             'meta_json'          => json_encode([
-                'online'           => true,
-                'internet_enabled' => true,
-                'bandwidth_in'     => 10.0,
-                'bandwidth_out'    => 15.0,
+                'online'           => false,
+                'internet_enabled' => false,
+                'bandwidth_in'     => 0.0,
+                'bandwidth_out'    => 0.0,
             ]),
             'created_at' => now(),
             'updated_at' => now(),
         ];
 
         $id = DB::table('routers')->insertGetId($payload);
+
+        // Langsung coba tes koneksi ke MikroTik asli saat ditambahkan
+        $statusNote = 'disimpan (menunggu koneksi)';
+        try {
+            $info = $this->mikrotik->testAndFetchResource([
+                'id'              => $id,
+                'name'            => $name,
+                'ip_host'         => $ipHost,
+                'port'            => $port,
+                'username'        => $username,
+                'password'        => $passwordPlain,
+                'connection_type' => $connTypeInput,
+                'auth_mode'       => $authModeInput,
+            ]);
+
+            if (!empty($info['online'])) {
+                DB::table('routers')->where('id', $id)->update([
+                    'is_online'   => 1,
+                    'model'       => $info['model'] ?? 'MikroTik',
+                    'os_version'  => $info['os_version'] ?? '-',
+                    'cpu_info'    => $info['cpu'] ?? '-',
+                    'memory_info' => $info['memory'] ?? '-',
+                    'meta_json'   => json_encode([
+                        'online'           => true,
+                        'internet_enabled' => true,
+                    ]),
+                    'updated_at'  => now(),
+                ]);
+                $statusNote = 'terhubung Online';
+            }
+        } catch (\Throwable $e) {
+            $statusNote = 'disimpan, namun router belum dapat dihubungi (' . $e->getMessage() . ')';
+        }
+
         $this->writeAuditLog(
             $id,
             $name,
             (string) $request->input('admin_name', 'Admin'),
             'add_router',
-            $payload['ip_host'],
-            "Menambahkan router {$name} ({$payload['ip_host']}:{$port} • {$connTypeInput} • {$authModeInput})."
+            $ipHost,
+            "Menambahkan router {$name} ({$ipHost}:{$port} • {$connTypeInput} • {$authModeInput}) — {$statusNote}."
         );
 
-        return response()->json(['success' => true, 'message' => 'Router berhasil ditambahkan!', 'id' => $id], 201);
+        return response()->json([
+            'success' => true,
+            'message' => "Router {$statusNote}!",
+            'id'      => $id,
+        ], 201);
     }
 
     /**
@@ -406,11 +378,11 @@ class NetworkController extends Controller
         try {
             $info = $this->mikrotik->testAndFetchResource($this->routerRowToArray($row));
             DB::table('routers')->where('id', $id)->update([
-                'is_online'   => $info['online'] ? 1 : 0,
-                'model'       => $info['model'],
-                'os_version'  => $info['os_version'],
-                'cpu_info'    => $info['cpu'],
-                'memory_info' => $info['memory'],
+                'is_online'   => !empty($info['online']) ? 1 : 0,
+                'model'       => $info['model'] ?? $row->model,
+                'os_version'  => $info['os_version'] ?? $row->os_version,
+                'cpu_info'    => $info['cpu'] ?? $row->cpu_info,
+                'memory_info' => $info['memory'] ?? $row->memory_info,
                 'updated_at'  => now(),
             ]);
             return response()->json(['success' => true, 'data' => $info]);
@@ -421,7 +393,7 @@ class NetworkController extends Controller
     }
 
     /**
-     * POST /api/admin/routers/discover -> Router Discovery (Probe IP/Port MikroTik)
+     * POST /api/admin/routers/discover -> Router Discovery (Probe IP/Port MikroTik Real)
      */
     public function discover(Request $request)
     {
@@ -452,30 +424,33 @@ class NetworkController extends Controller
             }
         }
 
-        // Jika belum ada IP reachable dari cloud, berikan saran template siap pakai
-        if (empty($found)) {
-            $found = [
-                [
-                    'name'            => 'MikroTik Baru (Mode Simulasi)',
-                    'ip_host'         => $host !== '' ? $host : '192.168.88.1',
-                    'port'            => 8728,
-                    'connection_type' => 'simulasi',
-                    'reachable'       => false,
-                ],
-            ];
-        }
-
         return response()->json(['success' => true, 'data' => $found]);
     }
 
     /**
-     * GET /api/admin/routers/{id}/monitoring -> Detail Monitoring Lengkap
+     * GET /api/admin/routers/{id}/monitoring -> Detail Monitoring Lengkap (REAL ONLY)
      */
     public function monitoring($id)
     {
         $this->ensureTables();
         $row = DB::table('routers')->where('id', $id)->first();
         if (!$row) return response()->json(['success' => false, 'message' => 'Router tidak ditemukan.'], 404);
+
+        $logs = DB::table('network_activity_logs')
+            ->where('router_id', $id)
+            ->orderByDesc('id')
+            ->limit(30)
+            ->get();
+
+        $routerMeta = [
+            'id'              => (int) $row->id,
+            'name'            => $row->name,
+            'location'        => $row->location,
+            'ip_host'         => $row->ip_host,
+            'port'            => (int) $row->port,
+            'connection_type' => $row->connection_type,
+            'auth_mode'       => $row->auth_mode,
+        ];
 
         try {
             $arr = $this->routerRowToArray($row);
@@ -484,31 +459,57 @@ class NetworkController extends Controller
             if (!empty($data['meta_json'])) {
                 DB::table('routers')->where('id', $id)->update([
                     'meta_json'  => json_encode($data['meta_json']),
-                    'is_online'  => ($data['router_info']['online'] ?? true) ? 1 : 0,
+                    'is_online'  => ($data['router_info']['online'] ?? false) ? 1 : 0,
                     'updated_at' => now(),
                 ]);
             }
 
-            $logs = DB::table('network_activity_logs')
-                ->where('router_id', $id)
-                ->orderByDesc('id')
-                ->limit(30)
-                ->get();
-
-            $data['admin_logs'] = $logs;
-            $data['router_meta'] = [
-                'id'              => (int) $row->id,
-                'name'            => $row->name,
-                'location'        => $row->location,
-                'ip_host'         => $row->ip_host,
-                'port'            => (int) $row->port,
-                'connection_type' => $row->connection_type,
-                'auth_mode'       => $row->auth_mode,
-            ];
+            $data['admin_logs']  = $logs;
+            $data['router_meta'] = $routerMeta;
 
             return response()->json(['success' => true, 'data' => $data]);
         } catch (\Throwable $e) {
-            return response()->json(['success' => false, 'message' => 'Router tidak dapat diakses: ' . $e->getMessage()], 500);
+            DB::table('routers')->where('id', $id)->update([
+                'is_online'  => 0,
+                'updated_at' => now(),
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'data'    => [
+                    'router_info' => [
+                        'online'     => false,
+                        'model'      => $row->model ?? 'MikroTik',
+                        'os_version' => $row->os_version ?? '-',
+                        'cpu'        => $row->cpu_info ?? '-',
+                        'cpu_load'   => 0,
+                        'memory'     => $row->memory_info ?? '-',
+                        'free_mem'   => '-',
+                        'uptime'     => '-',
+                    ],
+                    'internet_enabled' => false,
+                    'active_users'     => 0,
+                    'bandwidth_in'     => 0.0,
+                    'bandwidth_out'    => 0.0,
+                    'traffic_history'  => [],
+                    'pppoe_users'      => [],
+                    'dhcp_leases'      => [],
+                    'hotspot_active'   => [],
+                    'interfaces'       => [],
+                    'queues'           => [],
+                    'ping'             => ['target' => '-', 'avg_ms' => 0, 'packet_loss' => 100],
+                    'system_logs'      => [
+                        [
+                            'time'    => now()->format('H:i:s'),
+                            'topics'  => 'error',
+                            'message' => 'Router tidak dapat diakses: ' . $e->getMessage(),
+                        ],
+                    ],
+                    'blocked_sites'    => [],
+                    'admin_logs'       => $logs,
+                    'router_meta'      => $routerMeta,
+                ],
+            ]);
         }
     }
 
