@@ -6,10 +6,65 @@ use App\Http\Controllers\Controller;
 use App\Models\Product;
 use App\Models\Customer;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 
 class ProductController extends Controller
 {
+    private function safeErrorMessage(\Throwable $e, string $fallback = 'Terjadi kesalahan pada server.'): string
+    {
+        return config('app.debug') ? $e->getMessage() : $fallback;
+    }
+
+    private function formatProduct($p): array
+    {
+        $mbps = (int) ($p->kecepatan_mbps ?? $p->speed ?? 10);
+        $harga = (double) ($p->harga ?? $p->price ?? 0);
+        $nama = $p->nama_paket ?? $p->name ?? $p->nama ?? 'Paket Internet #' . $p->id;
+
+        $gambar = $p->url_gambar
+            ?? $p->gambar
+            ?? $p->image
+            ?? $p->foto
+            ?? $p->image_url
+            ?? null;
+
+        $deskripsi = $p->deskripsi ?? $p->description ?? 'Paket internet fiber optic ultra stabil.';
+
+        return [
+            'id'             => $p->id,
+            'nama_paket'     => $nama,
+            'name'           => $nama,
+            'nama'           => $nama,
+            'kecepatan_mbps' => $mbps,
+            'speed'          => $mbps . ' Mbps',
+            'harga'          => $harga,
+            'price'          => $harga,
+            'deskripsi'      => $deskripsi,
+            'description'    => $deskripsi,
+            'url_gambar'     => $gambar,
+            'gambar'         => $gambar,
+            'image'          => $gambar,
+            'image_url'      => $gambar,
+            'foto'           => $gambar,
+            'created_at'     => $p->created_at,
+        ];
+    }
+
+    private function sanitizeImageUrl(?string $url): ?string
+    {
+        if ($url === null) return null;
+        $clean = trim($url);
+        if ($clean === '') return null;
+
+        // Cegah skema berbahaya seperti javascript: atau data:
+        if (preg_match('/^(javascript|vbscript|data):/i', $clean)) {
+            throw new \InvalidArgumentException('URL gambar tidak valid.');
+        }
+
+        return mb_substr($clean, 0, 500);
+    }
+
     /**
      * Mengambil semua paket produk internet
      */
@@ -17,47 +72,7 @@ class ProductController extends Controller
     {
         try {
             $products = Product::orderBy('id', 'asc')->get();
-
-            // Format data agar seragam dan terbaca di semua model Flutter
-            $data = $products->map(function ($p) {
-                $mbps = (int) ($p->kecepatan_mbps ?? $p->speed ?? 10);
-                $harga = (double) ($p->harga ?? $p->price ?? 0);
-                $nama = $p->nama_paket ?? $p->name ?? $p->nama ?? 'Paket Internet #' . $p->id;
-
-                // Ambil gambar dari berbagai variasi nama kolom
-                $gambar = $p->url_gambar 
-                    ?? $p->gambar 
-                    ?? $p->image 
-                    ?? $p->foto 
-                    ?? $p->image_url 
-                    ?? null;
-
-                $deskripsi = $p->deskripsi ?? $p->description ?? 'Paket internet fiber optic ultra stabil.';
-
-                return [
-                    'id'             => $p->id,
-                    // Nama Paket
-                    'nama_paket'     => $nama,
-                    'name'           => $nama,
-                    'nama'           => $nama,
-                    // Kecepatan
-                    'kecepatan_mbps' => $mbps,
-                    'speed'          => $mbps . ' Mbps',
-                    // Harga
-                    'harga'          => $harga,
-                    'price'          => $harga,
-                    // Deskripsi
-                    'deskripsi'      => $deskripsi,
-                    'description'    => $deskripsi,
-                    // SEMUA VARIASI KEY GAMBAR AGAR TIDAK MISMATCH DI FLUTTER:
-                    'url_gambar'     => $gambar,
-                    'gambar'         => $gambar,
-                    'image'          => $gambar,
-                    'image_url'      => $gambar,
-                    'foto'           => $gambar,
-                    'created_at'     => $p->created_at,
-                ];
-            });
+            $data = $products->map(fn($p) => $this->formatProduct($p));
 
             return response()->json([
                 'success' => true,
@@ -65,10 +80,41 @@ class ProductController extends Controller
                 'data'    => $data,
             ], 200);
         } catch (\Throwable $e) {
+            Log::error('Gagal memuat produk: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'status'  => 'error',
-                'message' => 'Gagal memuat produk: ' . $e->getMessage(),
+                'message' => 'Gagal memuat produk: ' . $this->safeErrorMessage($e),
+            ], 500);
+        }
+    }
+
+    /**
+     * Mengambil detail satu paket produk
+     */
+    public function show($id)
+    {
+        try {
+            $product = Product::find($id);
+            if (!$product) {
+                return response()->json([
+                    'success' => false,
+                    'status'  => 'error',
+                    'message' => "Paket dengan ID #$id tidak ditemukan",
+                ], 404);
+            }
+
+            return response()->json([
+                'success' => true,
+                'status'  => 'success',
+                'data'    => $this->formatProduct($product),
+            ], 200);
+        } catch (\Throwable $e) {
+            Log::error('Gagal memuat detail produk: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'status'  => 'error',
+                'message' => 'Gagal memuat produk: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }
@@ -79,25 +125,35 @@ class ProductController extends Controller
     public function store(Request $request)
     {
         try {
-            $namaPaket = $request->input('nama_paket') 
-                ?? $request->input('nama') 
-                ?? $request->input('name') 
-                ?? 'Paket Baru';
+            $namaPaket = mb_substr(trim((string) ($request->input('nama_paket')
+                ?? $request->input('nama')
+                ?? $request->input('name')
+                ?? 'Paket Baru')), 0, 150);
+
+            if ($namaPaket === '') {
+                return response()->json(['success' => false, 'status' => 'error', 'message' => 'Nama paket wajib diisi.'], 422);
+            }
 
             $kecepatanInput = (string) ($request->input('kecepatan_mbps') ?? $request->input('kecepatan') ?? $request->input('speed') ?? '10');
             $mbps = (int) preg_replace('/[^0-9]/', '', $kecepatanInput);
             if ($mbps <= 0) $mbps = 10;
 
             $harga = (int) ($request->input('harga') ?? $request->input('price') ?? 0);
-            
-            // Tangkap semua kemungkinan nama key gambar dari Flutter
-            $urlGambar = $request->input('url_gambar') 
-                ?? $request->input('gambar') 
-                ?? $request->input('image') 
-                ?? $request->input('image_url') 
+            if ($harga < 0) {
+                return response()->json(['success' => false, 'status' => 'error', 'message' => 'Harga paket tidak boleh bernilai negatif.'], 422);
+            }
+
+            $urlGambarRaw = $request->input('url_gambar')
+                ?? $request->input('gambar')
+                ?? $request->input('image')
+                ?? $request->input('image_url')
                 ?? $request->input('foto');
+            $urlGambar = $this->sanitizeImageUrl($urlGambarRaw !== null ? (string) $urlGambarRaw : null);
 
             $deskripsi = $request->input('deskripsi') ?? $request->input('description');
+            if ($deskripsi !== null) {
+                $deskripsi = mb_substr(trim((string) $deskripsi), 0, 1000);
+            }
 
             $dataSimpan = [
                 'nama_paket'     => $namaPaket,
@@ -105,7 +161,6 @@ class ProductController extends Controller
                 'harga'          => $harga,
             ];
 
-            // Cek nama kolom gambar yang tersedia di database Anda
             if ($urlGambar) {
                 if (Schema::hasColumn('products', 'url_gambar')) {
                     $dataSimpan['url_gambar'] = $urlGambar;
@@ -118,7 +173,6 @@ class ProductController extends Controller
                 }
             }
 
-            // Masukkan deskripsi jika kolomnya tersedia
             if ($deskripsi) {
                 if (Schema::hasColumn('products', 'deskripsi')) {
                     $dataSimpan['deskripsi'] = $deskripsi;
@@ -135,11 +189,14 @@ class ProductController extends Controller
                 'message' => 'Paket berhasil disimpan',
                 'data'    => $product,
             ], 201);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'status' => 'error', 'message' => $e->getMessage()], 422);
         } catch (\Throwable $e) {
+            Log::error('Gagal simpan paket: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'status'  => 'error',
-                'message' => 'Gagal simpan paket: ' . $e->getMessage(),
+                'message' => 'Gagal simpan paket: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }
@@ -159,50 +216,50 @@ class ProductController extends Controller
                 ], 404);
             }
 
-            $namaPaket = $request->input('nama_paket') 
-                ?? $request->input('nama') 
-                ?? $request->input('name') 
-                ?? $product->nama_paket;
+            $namaPaket = mb_substr(trim((string) ($request->input('nama_paket')
+                ?? $request->input('nama')
+                ?? $request->input('name')
+                ?? $product->nama_paket)), 0, 150);
+
+            if ($namaPaket === '') {
+                return response()->json(['success' => false, 'status' => 'error', 'message' => 'Nama paket wajib diisi.'], 422);
+            }
 
             $kecepatanInput = (string) ($request->input('kecepatan_mbps') ?? $request->input('kecepatan') ?? $request->input('speed') ?? $product->kecepatan_mbps);
             $mbps = (int) preg_replace('/[^0-9]/', '', $kecepatanInput);
             if ($mbps <= 0) $mbps = (int) $product->kecepatan_mbps;
 
             $harga = (int) ($request->input('harga') ?? $request->input('price') ?? $product->harga);
-            
-            // Tangkap semua kemungkinan nama key gambar yang dikirim Flutter
-            $urlGambar = $request->input('url_gambar') 
-                ?? $request->input('gambar') 
-                ?? $request->input('image') 
-                ?? $request->input('image_url') 
+            if ($harga < 0) {
+                return response()->json(['success' => false, 'status' => 'error', 'message' => 'Harga paket tidak boleh bernilai negatif.'], 422);
+            }
+
+            $urlGambarRaw = $request->input('url_gambar')
+                ?? $request->input('gambar')
+                ?? $request->input('image')
+                ?? $request->input('image_url')
                 ?? $request->input('foto')
-                ?? $product->url_gambar 
-                ?? $product->gambar 
+                ?? $product->url_gambar
+                ?? $product->gambar
                 ?? $product->image;
+            $urlGambar = $this->sanitizeImageUrl($urlGambarRaw !== null ? (string) $urlGambarRaw : null);
 
-            $deskripsi = $request->input('deskripsi') 
-                ?? $request->input('description') 
+            $deskripsi = $request->input('deskripsi')
+                ?? $request->input('description')
                 ?? $product->deskripsi;
+            if ($deskripsi !== null) {
+                $deskripsi = mb_substr(trim((string) $deskripsi), 0, 1000);
+            }
 
-            // Update ke objek model secara langsung
             $product->nama_paket = $namaPaket;
             $product->kecepatan_mbps = $mbps;
             $product->harga = $harga;
 
-            // Simpan gambar ke kolom yang benar di tabel products
             if ($urlGambar) {
-                if (Schema::hasColumn('products', 'url_gambar')) {
-                    $product->url_gambar = $urlGambar;
-                }
-                if (Schema::hasColumn('products', 'gambar')) {
-                    $product->gambar = $urlGambar;
-                }
-                if (Schema::hasColumn('products', 'image')) {
-                    $product->image = $urlGambar;
-                }
-                if (Schema::hasColumn('products', 'foto')) {
-                    $product->foto = $urlGambar;
-                }
+                if (Schema::hasColumn('products', 'url_gambar')) $product->url_gambar = $urlGambar;
+                if (Schema::hasColumn('products', 'gambar')) $product->gambar = $urlGambar;
+                if (Schema::hasColumn('products', 'image')) $product->image = $urlGambar;
+                if (Schema::hasColumn('products', 'foto')) $product->foto = $urlGambar;
             }
 
             if (Schema::hasColumn('products', 'deskripsi')) {
@@ -211,7 +268,6 @@ class ProductController extends Controller
                 $product->description = $deskripsi;
             }
 
-            // Simpan perubahan ke MySQL
             $product->save();
 
             return response()->json([
@@ -220,11 +276,14 @@ class ProductController extends Controller
                 'message' => 'Paket berhasil diperbarui di database!',
                 'data'    => $product,
             ], 200);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'status' => 'error', 'message' => $e->getMessage()], 422);
         } catch (\Throwable $e) {
+            Log::error('Gagal update paket: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'status'  => 'error',
-                'message' => 'Gagal update paket: ' . $e->getMessage(),
+                'message' => 'Gagal update paket: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }
@@ -244,7 +303,6 @@ class ProductController extends Controller
                 ], 404);
             }
 
-            // CEK APAKAH PAKET MASIH DIGUNAKAN OLEH CUSTOMER
             if (class_exists(Customer::class)) {
                 $sedangDigunakan = Customer::where('product_id', $id)->count();
                 if ($sedangDigunakan > 0) {
@@ -264,10 +322,11 @@ class ProductController extends Controller
                 'message' => 'Paket berhasil dihapus',
             ], 200);
         } catch (\Throwable $e) {
+            Log::error('Gagal menghapus paket: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'status'  => 'error',
-                'message' => 'Gagal menghapus paket: ' . $e->getMessage(),
+                'message' => 'Gagal menghapus paket: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }

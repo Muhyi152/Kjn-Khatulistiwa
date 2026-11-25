@@ -6,9 +6,11 @@ use App\Http\Controllers\Controller;
 use App\Services\MikrotikService;
 use App\Models\Customer;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Log;
 
 class NetworkController extends Controller
 {
@@ -17,6 +19,46 @@ class NetworkController extends Controller
 
     public function __construct(private MikrotikService $mikrotik)
     {
+    }
+
+    private function safeErrorMessage(\Throwable $e, string $fallback = 'Terjadi kesalahan pada server.'): string
+    {
+        return config('app.debug') ? $e->getMessage() : $fallback;
+    }
+
+    private function currentAdminName(): string
+    {
+        $user = Auth::user();
+        return ($user && !empty($user->name)) ? (string) $user->name : 'Admin';
+    }
+
+    private function validateHostNotInternal(string $rawHost): void
+    {
+        $clean = trim($rawHost);
+        if ($clean === '' || preg_match('/[\s@?#\\\\]/', $clean)) {
+            throw new \InvalidArgumentException('Format IP/Host tidak valid.');
+        }
+
+        $bareHost = preg_replace('#^https?://#i', '', $clean);
+        $bareHost = explode('/', $bareHost)[0];
+        $bareHost = explode(':', $bareHost)[0];
+
+        $lower = strtolower($bareHost);
+        if ($bareHost === '' || in_array($lower, ['localhost', 'metadata.google.internal', 'metadata'], true) || str_ends_with($lower, '.local')) {
+            throw new \InvalidArgumentException('Host lokal atau metadata cloud tidak diizinkan.');
+        }
+
+        $ipToCheck = filter_var($bareHost, FILTER_VALIDATE_IP) ? $bareHost : @gethostbyname($bareHost);
+        if (filter_var($ipToCheck, FILTER_VALIDATE_IP)) {
+            if (
+                $ipToCheck === '0.0.0.0'
+                || $ipToCheck === '::1'
+                || str_starts_with($ipToCheck, '127.')
+                || str_starts_with($ipToCheck, '169.254.')
+            ) {
+                throw new \InvalidArgumentException('IP loopback atau metadata cloud tidak diizinkan.');
+            }
+        }
     }
 
     private function ensureTables(): void
@@ -30,8 +72,8 @@ class NetworkController extends Controller
                 $table->integer('port')->default(8728);
                 $table->string('username')->default('admin');
                 $table->text('password_encrypted')->nullable();
-                $table->string('connection_type', 30)->default('api_v6'); // api_v6 | api_ssl | rest_v7 | ssh
-                $table->string('auth_mode', 30)->default('pppoe');        // campuran | pppoe | hotspot | dhcp | radius | ipoe
+                $table->string('connection_type', 30)->default('api_v6');
+                $table->string('auth_mode', 30)->default('pppoe');
                 $table->string('model')->nullable();
                 $table->string('os_version')->nullable();
                 $table->string('cpu_info')->nullable();
@@ -56,7 +98,6 @@ class NetworkController extends Controller
             });
         }
 
-        // Bersihkan router simulasi lama dari database agar hanya tersisa router real
         try {
             DB::table('routers')->where('connection_type', 'simulasi')->delete();
         } catch (\Throwable $e) {}
@@ -75,11 +116,7 @@ class NetworkController extends Controller
     private function encryptPassword(?string $plain): string
     {
         if ($plain === null || $plain === '') return '';
-        try {
-            return Crypt::encryptString($plain);
-        } catch (\Throwable $e) {
-            return base64_encode($plain);
-        }
+        return Crypt::encryptString($plain);
     }
 
     private function decryptPassword(?string $enc): string
@@ -88,6 +125,7 @@ class NetworkController extends Controller
         try {
             return Crypt::decryptString($enc);
         } catch (\Throwable $e) {
+            // Fallback hanya untuk membaca data lama sebelum enkripsi aktif
             $b = base64_decode($enc, true);
             return $b !== false ? $b : '';
         }
@@ -130,7 +168,6 @@ class NetworkController extends Controller
 
         foreach ($rows as $row) {
             $arr = $this->routerRowToArray($row);
-            $meta = json_decode($row->meta_json ?? '{}', true) ?: [];
 
             $isOnline = false;
             $internetEnabled = false;
@@ -216,14 +253,20 @@ class NetworkController extends Controller
     {
         $this->ensureTables();
 
-        $name = trim((string) $request->input('name', ''));
-        $ipHost = trim((string) $request->input('ip_host', ''));
+        $name = mb_substr(trim((string) $request->input('name', '')), 0, 150);
+        $ipHost = mb_substr(trim((string) $request->input('ip_host', '')), 0, 255);
 
         if ($name === '' || $ipHost === '') {
             return response()->json([
                 'success' => false,
                 'message' => 'Nama router dan IP Publik / DDNS wajib diisi.',
             ], 422);
+        }
+
+        try {
+            $this->validateHostNotInternal($ipHost);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
         }
 
         $connTypeInput = strtolower(trim((string) $request->input('connection_type', 'api_v6')));
@@ -240,22 +283,26 @@ class NetworkController extends Controller
         }
 
         $port = (int) ($request->input('port') ?: $this->defaultPortForType($connTypeInput));
-        $username = trim((string) $request->input('username', 'admin'));
+        if ($port < 1 || $port > 65535) {
+            return response()->json(['success' => false, 'message' => 'Port harus antara 1 - 65535.'], 422);
+        }
+
+        $username = mb_substr(trim((string) $request->input('username', 'admin')), 0, 100);
         $passwordPlain = (string) $request->input('password', '');
 
         $payload = [
             'name'               => $name,
-            'location'           => trim((string) $request->input('location', 'Pusat')),
+            'location'           => mb_substr(trim((string) $request->input('location', 'Pusat')), 0, 150),
             'ip_host'            => $ipHost,
             'port'               => $port,
             'username'           => $username,
             'password_encrypted' => $this->encryptPassword($passwordPlain),
             'connection_type'    => $connTypeInput,
             'auth_mode'          => $authModeInput,
-            'model'              => $request->input('model', 'MikroTik'),
-            'os_version'         => $request->input('os_version', '-'),
-            'cpu_info'           => $request->input('cpu_info', '-'),
-            'memory_info'        => $request->input('memory_info', '-'),
+            'model'              => mb_substr((string) $request->input('model', 'MikroTik'), 0, 100),
+            'os_version'         => mb_substr((string) $request->input('os_version', '-'), 0, 100),
+            'cpu_info'           => mb_substr((string) $request->input('cpu_info', '-'), 0, 100),
+            'memory_info'        => mb_substr((string) $request->input('memory_info', '-'), 0, 100),
             'is_online'          => 0,
             'meta_json'          => json_encode([
                 'online'           => false,
@@ -269,7 +316,6 @@ class NetworkController extends Controller
 
         $id = DB::table('routers')->insertGetId($payload);
 
-        // Langsung coba tes koneksi ke MikroTik asli saat ditambahkan
         $statusNote = 'disimpan (menunggu koneksi)';
         try {
             $info = $this->mikrotik->testAndFetchResource([
@@ -299,13 +345,15 @@ class NetworkController extends Controller
                 $statusNote = 'terhubung Online';
             }
         } catch (\Throwable $e) {
-            $statusNote = 'disimpan, namun router belum dapat dihubungi (' . $e->getMessage() . ')';
+            Log::warning("Router #{$id} belum terhubung saat store: " . $e->getMessage());
+            $statusNote = 'disimpan, namun router belum dapat dihubungi'
+                . (config('app.debug') ? ' (' . $e->getMessage() . ')' : '');
         }
 
         $this->writeAuditLog(
             $id,
             $name,
-            (string) $request->input('admin_name', 'Admin'),
+            $this->currentAdminName(),
             'add_router',
             $ipHost,
             "Menambahkan router {$name} ({$ipHost}:{$port} • {$connTypeInput} • {$authModeInput}) — {$statusNote}."
@@ -328,8 +376,21 @@ class NetworkController extends Controller
         if (!$row) return response()->json(['success' => false, 'message' => 'Router tidak ditemukan.'], 404);
 
         $update = ['updated_at' => now()];
-        foreach (['name', 'location', 'ip_host', 'username', 'model', 'os_version'] as $f) {
-            if ($request->has($f)) $update[$f] = $request->input($f);
+
+        if ($request->has('ip_host')) {
+            $newHost = mb_substr(trim((string) $request->input('ip_host', '')), 0, 255);
+            try {
+                $this->validateHostNotInternal($newHost);
+            } catch (\InvalidArgumentException $e) {
+                return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+            }
+            $update['ip_host'] = $newHost;
+        }
+
+        foreach (['name', 'location', 'username', 'model', 'os_version'] as $f) {
+            if ($request->has($f)) {
+                $update[$f] = mb_substr(trim((string) $request->input($f)), 0, 150);
+            }
         }
 
         if ($request->has('connection_type')) {
@@ -347,7 +408,14 @@ class NetworkController extends Controller
             }
         }
 
-        if ($request->has('port')) $update['port'] = (int) $request->input('port');
+        if ($request->has('port')) {
+            $port = (int) $request->input('port');
+            if ($port < 1 || $port > 65535) {
+                return response()->json(['success' => false, 'message' => 'Port harus antara 1 - 65535.'], 422);
+            }
+            $update['port'] = $port;
+        }
+
         if ($request->filled('password')) {
             $update['password_encrypted'] = $this->encryptPassword((string) $request->input('password'));
         }
@@ -387,8 +455,12 @@ class NetworkController extends Controller
             ]);
             return response()->json(['success' => true, 'data' => $info]);
         } catch (\Throwable $e) {
+            Log::warning("Test koneksi router #{$id} gagal: " . $e->getMessage());
             DB::table('routers')->where('id', $id)->update(['is_online' => 0, 'updated_at' => now()]);
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 400);
+            return response()->json([
+                'success' => false,
+                'message' => $this->safeErrorMessage($e, 'Gagal terhubung ke router. Periksa IP, port, dan kredensial.'),
+            ], 400);
         }
     }
 
@@ -401,6 +473,15 @@ class NetworkController extends Controller
         $found = [];
 
         if ($host !== '') {
+            try {
+                $this->validateHostNotInternal($host);
+            } catch (\InvalidArgumentException $e) {
+                return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+            }
+
+            $bareHost = preg_replace('#^https?://#i', '', $host);
+            $bareHost = explode('/', explode(':', $bareHost)[0])[0];
+
             $probePorts = [
                 8729 => 'api_ssl',
                 8728 => 'api_v6',
@@ -410,12 +491,12 @@ class NetworkController extends Controller
             ];
 
             foreach ($probePorts as $port => $type) {
-                $fp = @fsockopen($host, $port, $errno, $errstr, 1.5);
+                $fp = @fsockopen($bareHost, $port, $errno, $errstr, 1.5);
                 if ($fp) {
                     fclose($fp);
                     $found[] = [
-                        'name'            => "MikroTik ({$host}:{$port})",
-                        'ip_host'         => $host,
+                        'name'            => "MikroTik ({$bareHost}:{$port})",
+                        'ip_host'         => $bareHost,
                         'port'            => $port,
                         'connection_type' => $type,
                         'reachable'       => true,
@@ -469,6 +550,7 @@ class NetworkController extends Controller
 
             return response()->json(['success' => true, 'data' => $data]);
         } catch (\Throwable $e) {
+            Log::warning("Monitoring router #{$id} gagal: " . $e->getMessage());
             DB::table('routers')->where('id', $id)->update([
                 'is_online'  => 0,
                 'updated_at' => now(),
@@ -502,7 +584,7 @@ class NetworkController extends Controller
                         [
                             'time'    => now()->format('H:i:s'),
                             'topics'  => 'error',
-                            'message' => 'Router tidak dapat diakses: ' . $e->getMessage(),
+                            'message' => $this->safeErrorMessage($e, 'Router tidak dapat diakses saat ini.'),
                         ],
                     ],
                     'blocked_sites'    => [],
@@ -523,7 +605,7 @@ class NetworkController extends Controller
         if (!$row) return response()->json(['success' => false, 'message' => 'Router tidak ditemukan.'], 404);
 
         $action = trim((string) $request->input('action', ''));
-        $adminName = trim((string) $request->input('admin_name', 'Admin'));
+        $adminName = $this->currentAdminName();
         $params = $request->all();
 
         if ($action === '') {
@@ -541,7 +623,6 @@ class NetworkController extends Controller
                 ]);
             }
 
-            // Sinkronkan status isolir / aktif ke tabel customers bila terkait username PPPoE
             $targetUser = trim((string) ($params['username'] ?? $params['target'] ?? ''));
             if ($targetUser !== '' && in_array($action, ['disable_pppoe', 'block_customer', 'enable_pppoe', 'activate_customer'], true)) {
                 $isBlock = in_array($action, ['disable_pppoe', 'block_customer'], true);
@@ -571,9 +652,15 @@ class NetworkController extends Controller
                 'message' => $res['message'],
                 'ping'    => $res['ping'] ?? null,
             ]);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
         } catch (\Throwable $e) {
+            Log::error("Action router #{$id} ({$action}) gagal: " . $e->getMessage());
             $this->writeAuditLog($row->id, $row->name, $adminName, $action, '-', 'Gagal: ' . $e->getMessage(), 'FAILED');
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+            return response()->json([
+                'success' => false,
+                'message' => $this->safeErrorMessage($e, 'Gagal menjalankan perintah ke router.'),
+            ], 500);
         }
     }
 

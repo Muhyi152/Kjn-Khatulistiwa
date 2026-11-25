@@ -8,12 +8,20 @@ use App\Models\Customer;
 use App\Models\Product;
 use App\Models\Invoice;
 use App\Models\User;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class CustomerController extends Controller
 {
+    private function safeErrorMessage(\Throwable $e, string $fallback = 'Terjadi kesalahan pada server.'): string
+    {
+        return config('app.debug') ? $e->getMessage() : $fallback;
+    }
+
     /**
      * Tampilkan semua pelanggan beserta status TAGIHAN DARI MUTASI RIIL (INVOICE)
      */
@@ -24,7 +32,6 @@ class CustomerController extends Controller
             $customers = Customer::orderBy('id', 'desc')->get();
 
             $data = $customers->map(function ($c) use ($allProducts) {
-                // 1. Ambil info paket langganan
                 $product = $c->product_id ? $allProducts->get($c->product_id) : null;
                 if (!$product && $allProducts->isNotEmpty()) {
                     $product = $allProducts->first();
@@ -36,7 +43,6 @@ class CustomerController extends Controller
 
                 $tarifPaket = $product ? (double) ($product->harga ?? $product->price ?? 0) : 0.0;
 
-                // 2. LOGIKA MUTASI RIIL: Cek apakah ada invoice PENDING / BELUM DIBAYAR
                 $pendingInvoice = Invoice::where('customer_id', $c->id)
                     ->whereIn(DB::raw('UPPER(status)'), ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
                     ->orderBy('id', 'desc')
@@ -62,24 +68,17 @@ class CustomerController extends Controller
                     'username_pppoe'    => $pppoeVal,
                     'status'            => strtoupper($c->status ?? 'ACTIVE'),
                     'product_id'        => $product ? (int) $product->id : (int) $c->product_id,
-
-                    // Nama Paket
                     'nama_paket'        => $namaPaket,
                     'paket_internet'    => $namaPaket,
                     'paket'             => $namaPaket,
-
-                    // TAGIHAN RIIL (Dari Mutasi Invoice)
                     'tagihan'           => $tagihanRiil,
                     'total_tagihan'     => $tagihanRiil,
                     'nominal'           => $tagihanRiil,
                     'is_lunas'          => ($tagihanRiil <= 0),
                     'status_tagihan'    => $pendingInvoice ? 'BELUM_BAYAR' : 'LUNAS',
                     'nomor_invoice'     => $pendingInvoice ? $pendingInvoice->nomor_invoice : null,
-
-                    // Tarif Asli Paket Bulanan
                     'tarif_paket'       => $tarifPaket,
                     'harga_paket'       => $tarifPaket,
-
                     'created_at'        => $c->created_at,
                 ];
             });
@@ -88,11 +87,11 @@ class CustomerController extends Controller
                 'success' => true,
                 'data'    => $data,
             ], 200);
-
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            Log::error('Gagal mengambil data pelanggan: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
-                'message' => 'Gagal mengambil data pelanggan: ' . $e->getMessage(),
+                'message' => 'Gagal mengambil data pelanggan: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }
@@ -103,16 +102,38 @@ class CustomerController extends Controller
     public function store(Request $request)
     {
         try {
-            $nama     = trim((string) ($request->input('nama') ?? $request->input('name') ?? ''));
-            $noWa     = trim((string) ($request->input('no_wa') ?? $request->input('no_hp') ?? $request->input('phone') ?? '-'));
-            $alamat   = trim((string) ($request->input('address') ?? $request->input('alamat') ?? $request->input('alamat_pemasangan') ?? '-'));
+            $nama   = mb_substr(trim((string) ($request->input('nama') ?? $request->input('name') ?? '')), 0, 150);
+            $noWa   = mb_substr(trim((string) ($request->input('no_wa') ?? $request->input('no_hp') ?? $request->input('phone') ?? '-')), 0, 30);
+            $alamat = mb_substr(trim((string) ($request->input('address') ?? $request->input('alamat') ?? $request->input('alamat_pemasangan') ?? '-')), 0, 500);
 
-            $namaDepan = strtolower(explode(' ', $nama)[0] ?: 'user');
-            $email     = trim((string) ($request->input('email') ?? ($namaDepan . rand(10, 99) . '@kjn.id')));
-            $username  = trim((string) ($request->input('pppoe_username') ?? $request->input('username_pppoe') ?? ($namaDepan . '@kjn')));
-            $password  = $request->input('password') ?? '12345678';
+            if ($nama === '') {
+                return response()->json(['success' => false, 'message' => 'Nama pelanggan wajib diisi.'], 422);
+            }
 
-            // 1. Cek Paket
+            $namaDepan = preg_replace('/[^a-z0-9]/', '', strtolower(explode(' ', $nama)[0] ?: 'user')) ?: 'user';
+            $emailInput = trim((string) $request->input('email', ''));
+
+            if ($emailInput !== '') {
+                if (!filter_var($emailInput, FILTER_VALIDATE_EMAIL)) {
+                    return response()->json(['success' => false, 'message' => 'Format email tidak valid.'], 422);
+                }
+                if (User::whereRaw('LOWER(email) = ?', [strtolower($emailInput)])->exists()) {
+                    return response()->json(['success' => false, 'message' => 'Email sudah terdaftar pada akun lain.'], 422);
+                }
+                $email = strtolower($emailInput);
+            } else {
+                do {
+                    $email = $namaDepan . '.' . strtolower(Str::random(5)) . '@kjn.id';
+                } while (User::where('email', $email)->exists());
+            }
+
+            $username = mb_substr(trim((string) ($request->input('pppoe_username') ?? $request->input('username_pppoe') ?? ($namaDepan . '@kjn'))), 0, 100);
+            $passwordInput = (string) $request->input('password', '');
+            if ($passwordInput !== '' && strlen($passwordInput) < 6) {
+                return response()->json(['success' => false, 'message' => 'Password minimal 6 karakter.'], 422);
+            }
+            $password = $passwordInput !== '' ? $passwordInput : Str::random(12);
+
             $productId = $request->input('product_id') ?? $request->input('paket_id');
             $product   = $productId ? Product::find($productId) : null;
 
@@ -130,63 +151,61 @@ class CustomerController extends Controller
             }
             $productId = $product ? $product->id : 1;
 
-            // 2. Buat Akun Login di tabel users
-            $user = User::where('email', $email)->first();
-            if (!$user) {
-                $user = User::create([
-                    'name'              => $nama,
-                    'email'             => $email,
-                    'password'          => Hash::make($password),
-                    'role'              => 'customer',
-                    'email_verified_at' => now(),
+            $customer = DB::transaction(function () use ($nama, $email, $password, $noWa, $alamat, $username, $productId, $product, $request) {
+                $user = new User([
+                    'name'     => $nama,
+                    'email'    => $email,
+                    'password' => Hash::make($password),
                 ]);
-            }
+                $user->role = 'customer';
+                $user->email_verified_at = now();
+                $user->save();
 
-            // 3. Buat Data di tabel customers sesuai kolom yang tersedia di DB
-            $customerData = [];
-            if (Schema::hasColumn('customers', 'user_id')) $customerData['user_id'] = $user->id;
-            if (Schema::hasColumn('customers', 'email')) $customerData['email'] = $email;
-            if (Schema::hasColumn('customers', 'nama')) $customerData['nama'] = $nama;
-            if (Schema::hasColumn('customers', 'name')) $customerData['name'] = $nama;
-            if (Schema::hasColumn('customers', 'no_wa')) $customerData['no_wa'] = $noWa;
-            if (Schema::hasColumn('customers', 'no_hp')) $customerData['no_hp'] = $noWa;
-            if (Schema::hasColumn('customers', 'phone')) $customerData['phone'] = $noWa;
-            if (Schema::hasColumn('customers', 'address')) $customerData['address'] = $alamat;
-            if (Schema::hasColumn('customers', 'alamat')) $customerData['alamat'] = $alamat;
-            if (Schema::hasColumn('customers', 'pppoe_username')) $customerData['pppoe_username'] = $username;
-            if (Schema::hasColumn('customers', 'username_pppoe')) $customerData['username_pppoe'] = $username;
-            if (Schema::hasColumn('customers', 'product_id')) $customerData['product_id'] = (int) $productId;
-            if (Schema::hasColumn('customers', 'nama_paket') && $product) {
-                $customerData['nama_paket'] = $product->nama_paket ?? $product->name ?? null;
-            }
-            if (Schema::hasColumn('customers', 'status')) {
-                $customerData['status'] = $this->normalizeCustomerStatus($request->input('status', 'ACTIVE'));
-            }
-            if (Schema::hasColumn('customers', 'status_koneksi')) {
-                $customerData['status_koneksi'] = 'Online';
-            }
-            if (Schema::hasColumn('customers', 'created_at')) $customerData['created_at'] = now();
-            if (Schema::hasColumn('customers', 'updated_at')) $customerData['updated_at'] = now();
+                $customerData = [];
+                if (Schema::hasColumn('customers', 'user_id')) $customerData['user_id'] = $user->id;
+                if (Schema::hasColumn('customers', 'email')) $customerData['email'] = $email;
+                if (Schema::hasColumn('customers', 'nama')) $customerData['nama'] = $nama;
+                if (Schema::hasColumn('customers', 'name')) $customerData['name'] = $nama;
+                if (Schema::hasColumn('customers', 'no_wa')) $customerData['no_wa'] = $noWa;
+                if (Schema::hasColumn('customers', 'no_hp')) $customerData['no_hp'] = $noWa;
+                if (Schema::hasColumn('customers', 'phone')) $customerData['phone'] = $noWa;
+                if (Schema::hasColumn('customers', 'address')) $customerData['address'] = $alamat;
+                if (Schema::hasColumn('customers', 'alamat')) $customerData['alamat'] = $alamat;
+                if (Schema::hasColumn('customers', 'pppoe_username')) $customerData['pppoe_username'] = $username;
+                if (Schema::hasColumn('customers', 'username_pppoe')) $customerData['username_pppoe'] = $username;
+                if (Schema::hasColumn('customers', 'product_id')) $customerData['product_id'] = (int) $productId;
+                if (Schema::hasColumn('customers', 'nama_paket') && $product) {
+                    $customerData['nama_paket'] = $product->nama_paket ?? $product->name ?? null;
+                }
+                if (Schema::hasColumn('customers', 'status')) {
+                    $customerData['status'] = $this->normalizeCustomerStatus((string) $request->input('status', 'ACTIVE'));
+                }
+                if (Schema::hasColumn('customers', 'status_koneksi')) {
+                    $customerData['status_koneksi'] = 'Online';
+                }
+                if (Schema::hasColumn('customers', 'created_at')) $customerData['created_at'] = now();
+                if (Schema::hasColumn('customers', 'updated_at')) $customerData['updated_at'] = now();
 
-            $newId = DB::table('customers')->insertGetId($customerData);
-            $customer = Customer::find($newId);
+                $newId = DB::table('customers')->insertGetId($customerData);
+                return Customer::find($newId);
+            });
 
             return response()->json([
                 'success' => true,
                 'message' => 'Pelanggan berhasil ditambahkan',
                 'data'    => $customer,
             ], 201);
-
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            Log::error('Gagal menambah pelanggan: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
-                'message' => 'Gagal menambah pelanggan: ' . $e->getMessage(),
+                'message' => 'Gagal menambah pelanggan: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }
 
     /**
-     * Update Pelanggan (Mendukung semua variasi nama field & tipe kolom DB)
+     * Update Pelanggan
      */
     public function update(Request $request, $id)
     {
@@ -199,7 +218,6 @@ class CustomerController extends Controller
                 ], 404);
             }
 
-            // Pastikan kolom PPPoE dan Alamat tersedia jika sebelumnya belum ada di tabel
             try {
                 if (!Schema::hasColumn('customers', 'pppoe_username') && !Schema::hasColumn('customers', 'username_pppoe')) {
                     Schema::table('customers', function ($table) {
@@ -216,9 +234,8 @@ class CustomerController extends Controller
             $updateData = [];
             $namaBaru = null;
 
-            // 1. Nama Pelanggan
             if ($request->hasAny(['nama', 'name', 'nama_pelanggan'])) {
-                $namaBaru = trim((string) ($request->input('nama') ?? $request->input('name') ?? $request->input('nama_pelanggan') ?? ''));
+                $namaBaru = mb_substr(trim((string) ($request->input('nama') ?? $request->input('name') ?? $request->input('nama_pelanggan') ?? '')), 0, 150);
                 if ($namaBaru === '') {
                     return response()->json([
                         'success' => false,
@@ -229,17 +246,15 @@ class CustomerController extends Controller
                 if (Schema::hasColumn('customers', 'name')) $updateData['name'] = $namaBaru;
             }
 
-            // 2. No. WhatsApp / HP
             if ($request->hasAny(['no_wa', 'no_hp', 'phone', 'telepon', 'no_telp'])) {
-                $noHp = trim((string) ($request->input('no_wa') ?? $request->input('no_hp') ?? $request->input('phone') ?? $request->input('telepon') ?? $request->input('no_telp') ?? ''));
+                $noHp = mb_substr(trim((string) ($request->input('no_wa') ?? $request->input('no_hp') ?? $request->input('phone') ?? $request->input('telepon') ?? $request->input('no_telp') ?? '')), 0, 30);
                 if (Schema::hasColumn('customers', 'no_wa')) $updateData['no_wa'] = $noHp;
                 if (Schema::hasColumn('customers', 'no_hp')) $updateData['no_hp'] = $noHp;
                 if (Schema::hasColumn('customers', 'phone')) $updateData['phone'] = $noHp;
             }
 
-            // 3. Alamat Pemasangan
             if ($request->hasAny(['address', 'alamat', 'alamat_pemasangan'])) {
-                $alamatInput = trim((string) ($request->input('address') ?? $request->input('alamat') ?? $request->input('alamat_pemasangan') ?? ''));
+                $alamatInput = mb_substr(trim((string) ($request->input('address') ?? $request->input('alamat') ?? $request->input('alamat_pemasangan') ?? '')), 0, 500);
                 $alamatVal = ($alamatInput === '' || $alamatInput === '-') ? null : $alamatInput;
 
                 if (Schema::hasColumn('customers', 'address')) $updateData['address'] = $alamatVal;
@@ -247,16 +262,14 @@ class CustomerController extends Controller
                 if (Schema::hasColumn('customers', 'alamat_pemasangan')) $updateData['alamat_pemasangan'] = $alamatVal;
             }
 
-            // 4. Username PPPoE
             if ($request->hasAny(['pppoe_username', 'username_pppoe', 'pppoe', 'username'])) {
-                $pppoeInput = trim((string) ($request->input('pppoe_username') ?? $request->input('username_pppoe') ?? $request->input('pppoe') ?? $request->input('username') ?? ''));
+                $pppoeInput = mb_substr(trim((string) ($request->input('pppoe_username') ?? $request->input('username_pppoe') ?? $request->input('pppoe') ?? $request->input('username') ?? '')), 0, 100);
                 $pppoeVal = ($pppoeInput === '' || $pppoeInput === '-') ? null : $pppoeInput;
 
                 if (Schema::hasColumn('customers', 'pppoe_username')) $updateData['pppoe_username'] = $pppoeVal;
                 if (Schema::hasColumn('customers', 'username_pppoe')) $updateData['username_pppoe'] = $pppoeVal;
             }
 
-            // 5. Status Langganan
             if ($request->hasAny(['status', 'status_langganan'])) {
                 $rawStatus = (string) ($request->input('status') ?? $request->input('status_langganan') ?? 'ACTIVE');
                 $normalizedStatus = $this->normalizeCustomerStatus($rawStatus);
@@ -270,7 +283,6 @@ class CustomerController extends Controller
                 }
             }
 
-            // 6. Pilihan Paket Internet
             $productIdInput = $request->input('product_id') ?? $request->input('paket_id');
             $namaPaketInput = $request->input('paket') ?? $request->input('nama_paket');
             $product = null;
@@ -305,12 +317,10 @@ class CustomerController extends Controller
                 $updateData['updated_at'] = now();
             }
 
-            // Update langsung via DB Query Builder agar tidak terhambat $fillable pada Model
             if (!empty($updateData)) {
                 DB::table('customers')->where('id', $customer->id)->update($updateData);
             }
 
-            // Sinkronkan nama ke tabel users jika terhubung
             if ($namaBaru !== null && !empty($customer->user_id)) {
                 try {
                     User::where('id', $customer->user_id)->update(['name' => $namaBaru]);
@@ -324,11 +334,11 @@ class CustomerController extends Controller
                 'message' => 'Data pelanggan berhasil diperbarui',
                 'data'    => $fresh,
             ], 200);
-
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            Log::error('Gagal mengubah pelanggan: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
-                'message' => 'Gagal mengubah pelanggan: ' . $e->getMessage(),
+                'message' => 'Gagal mengubah pelanggan: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }
@@ -339,38 +349,49 @@ class CustomerController extends Controller
     public function destroy($id)
     {
         try {
-            $customer = Customer::findOrFail($id);
+            $customer = Customer::find($id);
+            if (!$customer) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Pelanggan tidak ditemukan.',
+                ], 404);
+            }
+
             $customer->delete();
 
             return response()->json([
                 'success' => true,
                 'message' => 'Pelanggan berhasil dihapus',
             ], 200);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            Log::error('Gagal menghapus pelanggan: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
-                'message' => 'Gagal menghapus pelanggan: ' . $e->getMessage(),
+                'message' => 'Gagal menghapus pelanggan: ' . $this->safeErrorMessage($e),
             ], 500);
         }
     }
 
     /**
-     * Ganti Password Customer
+     * Ganti Password User yang Sedang Login (Anti-IDOR)
      */
     public function gantiPassword(Request $request)
     {
         try {
-            $userId       = $request->input('user_id');
-            $passwordLama = $request->input('password_lama');
-            $passwordBaru = $request->input('password_baru');
+            $user = Auth::user();
+            if (!$user) {
+                return response()->json(['success' => false, 'message' => 'Silakan login terlebih dahulu.'], 401);
+            }
 
-            if (empty($userId) || empty($passwordLama) || empty($passwordBaru)) {
+            $passwordLama = (string) $request->input('password_lama', '');
+            $passwordBaru = (string) $request->input('password_baru', '');
+
+            if ($passwordLama === '' || $passwordBaru === '') {
                 return response()->json(['success' => false, 'message' => 'Semua data wajib diisi!'], 422);
             }
 
-            $user = is_numeric($userId) ? User::find($userId) : User::where('email', $userId)->first();
-            if (!$user) {
-                return response()->json(['success' => false, 'message' => 'User tidak ditemukan.'], 404);
+            if (strlen($passwordBaru) < 6) {
+                return response()->json(['success' => false, 'message' => 'Kata sandi baru minimal 6 karakter!'], 422);
             }
 
             if (!Hash::check($passwordLama, $user->password)) {
@@ -380,16 +401,23 @@ class CustomerController extends Controller
             $user->password = Hash::make($passwordBaru);
             $user->save();
 
-            return response()->json(['success' => true, 'message' => 'Kata sandi berhasil diperbarui.'], 200);
+            // Putuskan token lama selain token aktif saat ini jika ada
+            if (method_exists($user, 'tokens')) {
+                $currentTokenId = $user->currentAccessToken()?->id;
+                $query = $user->tokens();
+                if ($currentTokenId) {
+                    $query->where('id', '!=', $currentTokenId);
+                }
+                $query->delete();
+            }
 
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+            return response()->json(['success' => true, 'message' => 'Kata sandi berhasil diperbarui.'], 200);
+        } catch (\Throwable $e) {
+            Log::error('Gagal ganti password: ' . $e->getMessage());
+            return response()->json(['success' => false, 'message' => $this->safeErrorMessage($e)], 500);
         }
     }
 
-    /**
-     * Helper: Normalisasi status agar selalu cocok dengan tipe kolom (VARCHAR / ENUM) di MySQL
-     */
     private function normalizeCustomerStatus(string $rawStatus): string
     {
         $upper = strtoupper(trim($rawStatus));
