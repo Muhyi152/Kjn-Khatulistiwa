@@ -8,6 +8,8 @@ use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
 
@@ -2039,28 +2041,238 @@ Route::post('/login', function (Request $request) {
 });
 
 // =========================================================================
+// LUPA PASSWORD (CARI USERNAME / PPPOE / EMAIL -> KIRIM PASSWORD KE GMAIL)
+// =========================================================================
+Route::post('/forgot-password', function (Request $request) {
+    try {
+        $identifier = trim((string) (
+            $request->input('identifier')
+            ?? $request->input('email')
+            ?? $request->input('username')
+            ?? ''
+        ));
+
+        if ($identifier === '') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username, ID PPPoE, atau Email wajib diisi.',
+            ], 422);
+        }
+
+        // Pastikan kolom recovery_email tersedia di tabel users jika belum dimigrasi
+        try {
+            if (!Schema::hasColumn('users', 'recovery_email')) {
+                Schema::table('users', function ($table) {
+                    $table->string('recovery_email')->nullable()->after('email');
+                });
+            }
+        } catch (\Throwable $schemaErr) {}
+
+        $idLower  = strtolower($identifier);
+        $user     = null;
+        $customer = null;
+
+        // 1. Cari di tabel users: email -> recovery_email -> username (jika ada)
+        $user = User::whereRaw('LOWER(email) = ?', [$idLower])->first();
+
+        if (!$user && Schema::hasColumn('users', 'recovery_email')) {
+            $user = User::whereRaw('LOWER(recovery_email) = ?', [$idLower])->first();
+        }
+
+        if (!$user && Schema::hasColumn('users', 'username')) {
+            $user = User::whereRaw('LOWER(username) = ?', [$idLower])->first();
+        }
+
+        // 2. Jika belum ketemu, cari di tabel customers: pppoe_username / username_pppoe / email
+        if (!$user && Schema::hasTable('customers')) {
+            if (Schema::hasColumn('customers', 'pppoe_username')) {
+                $customer = Customer::whereRaw('LOWER(pppoe_username) = ?', [$idLower])->first();
+            }
+            if (!$customer && Schema::hasColumn('customers', 'username_pppoe')) {
+                $customer = Customer::whereRaw('LOWER(username_pppoe) = ?', [$idLower])->first();
+            }
+            if (!$customer && Schema::hasColumn('customers', 'email')) {
+                $customer = Customer::whereRaw('LOWER(email) = ?', [$idLower])->first();
+            }
+        }
+
+        // 3. Fallback terakhir: cari berdasarkan nama di users atau customers
+        if (!$user && !$customer) {
+            $user = User::whereRaw('LOWER(name) = ?', [$idLower])->first();
+        }
+        if (!$user && !$customer && Schema::hasTable('customers')) {
+            if (Schema::hasColumn('customers', 'nama')) {
+                $customer = Customer::whereRaw('LOWER(nama) = ?', [$idLower])->first();
+            }
+            if (!$customer && Schema::hasColumn('customers', 'name')) {
+                $customer = Customer::whereRaw('LOWER(name) = ?', [$idLower])->first();
+            }
+        }
+
+        // Hubungkan customer -> user jika yang ketemu baru data customer
+        if (!$user && $customer) {
+            if (!empty($customer->user_id)) {
+                $user = User::find($customer->user_id);
+            }
+            if (!$user && !empty($customer->email)) {
+                $user = User::whereRaw('LOWER(email) = ?', [strtolower($customer->email)])->first();
+            }
+            if (!$user) {
+                $custName = $customer->nama ?? $customer->name ?? null;
+                if (!empty($custName)) {
+                    $user = User::whereRaw('LOWER(name) = ?', [strtolower($custName)])->first();
+                }
+            }
+        }
+
+        // Hubungkan user -> customer (untuk fallback email jika diperlukan)
+        if ($user && !$customer && Schema::hasTable('customers')) {
+            if (Schema::hasColumn('customers', 'user_id')) {
+                $customer = Customer::where('user_id', $user->id)->first();
+            }
+            if (!$customer && Schema::hasColumn('customers', 'email') && !empty($user->email)) {
+                $customer = Customer::where('email', $user->email)->first();
+            }
+        }
+
+        if (!$user) {
+            return response()->json([
+                'success' => false,
+                'message' => "Akun dengan identitas \"{$identifier}\" tidak ditemukan.",
+            ], 404);
+        }
+
+        // Tentukan email tujuan (prioritaskan recovery_email, lalu email utama)
+        $kandidatEmail = [
+            $user->recovery_email ?? null,
+            $customer->recovery_email ?? null,
+            $user->email ?? null,
+            $customer->email ?? null,
+        ];
+
+        $targetEmail = null;
+        foreach ($kandidatEmail as $cand) {
+            $cand = trim((string) $cand);
+            if ($cand !== '' && filter_var($cand, FILTER_VALIDATE_EMAIL)) {
+                $targetEmail = $cand;
+                break;
+            }
+        }
+
+        if (!$targetEmail) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Akun ini belum memiliki alamat email pemulihan yang valid.',
+            ], 422);
+        }
+
+        // Cek apakah mailer server masih mode log/array (SMTP belum disetting)
+        if (in_array(config('mail.default'), ['log', 'array'], true)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Layanan email SMTP di server Railway belum dikonfigurasi (MAIL_MAILER masih ' . config('mail.default') . ').',
+            ], 500);
+        }
+
+        // Generate password baru acak 8 karakter (mudah dibaca, tanpa karakter mirip O/0/l/1)
+        $karakter = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+        $passwordBaru = '';
+        for ($i = 0; $i < 8; $i++) {
+            $passwordBaru .= $karakter[random_int(0, strlen($karakter) - 1)];
+        }
+
+        // Gunakan transaction: password hanya tersimpan jika email benar-benar terkirim
+        DB::beginTransaction();
+        try {
+            DB::table('users')
+                ->where('id', $user->id)
+                ->update([
+                    'password'   => Hash::make($passwordBaru),
+                    'updated_at' => now(),
+                ]);
+
+            $isiPesan = "Halo {$user->name},\n\n"
+                . "Kami menerima permintaan reset password untuk akun BUMDES Khatulistiwa / KJN Billing Anda.\n\n"
+                . "Email Login : {$user->email}\n"
+                . "Password Baru : {$passwordBaru}\n\n"
+                . "Silakan gunakan password baru di atas untuk masuk ke aplikasi, lalu segera ganti password Anda jika diperlukan.\n\n"
+                . "Terima kasih,\nNusantara Teknologi - Billing System";
+
+            Mail::raw($isiPesan, function ($mail) use ($targetEmail) {
+                $mail->to($targetEmail)
+                    ->subject('Password Baru Akun - BUMDES Khatulistiwa Billing');
+            });
+
+            DB::commit();
+        } catch (\Throwable $mailErr) {
+            DB::rollBack();
+            Log::error('Gagal kirim email forgot-password: ' . $mailErr->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Gagal mengirim email ke pengguna. Periksa konfigurasi SMTP di server.',
+            ], 500);
+        }
+
+        // Sensor alamat email di response untuk keamanan (contoh: ro***@gmail.com)
+        [$local, $domain] = array_pad(explode('@', $targetEmail, 2), 2, '');
+        $maskedLocal = strlen($local) > 2
+            ? substr($local, 0, 2) . str_repeat('*', max(3, strlen($local) - 2))
+            : substr($local, 0, 1) . '***';
+        $maskedEmail = "{$maskedLocal}@{$domain}";
+
+        return response()->json([
+            'success' => true,
+            'message' => "Password baru telah dikirim ke {$maskedEmail}. Silakan cek kotak masuk atau folder Spam.",
+        ], 200);
+
+    } catch (\Throwable $e) {
+        Log::error('Error forgot-password: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'message' => 'Terjadi kesalahan sistem: ' . $e->getMessage(),
+        ], 500);
+    }
+});
+
+// =========================================================================
 // REGISTER (CUSTOMER BARU + NOTIFIKASI KE ADMIN & CUSTOMER)
 // =========================================================================
 Route::post('/register', function (Request $request) use ($createNotification) {
     try {
         $validated = $request->validate([
-            'name'     => 'required|string|max:255',
-            'email'    => 'required|email|max:255|unique:users,email',
-            'password' => 'required|string|min:6',
-            'phone'    => 'nullable|string',
+            'name'           => 'required|string|max:255',
+            'email'          => 'required|email|max:255|unique:users,email',
+            'recovery_email' => 'nullable|email|max:255',
+            'password'       => 'required|string|min:6',
+            'phone'          => 'nullable|string',
         ]);
+
+        // Otomatis pastikan kolom recovery_email tersedia di tabel users
+        try {
+            if (!Schema::hasColumn('users', 'recovery_email')) {
+                Schema::table('users', function ($table) {
+                    $table->string('recovery_email')->nullable()->after('email');
+                });
+            }
+        } catch (\Throwable $schemaErr) {}
 
         $role = strtolower(trim($request->input('role', 'customer')));
         $noHp = $request->input('phone') ?? $request->input('no_hp') ?? '';
 
         $result = DB::transaction(function () use ($validated, $role, $noHp, $request) {
-            $user = User::create([
+            $userData = [
                 'name'              => $validated['name'],
                 'email'             => $validated['email'],
                 'password'          => bcrypt($validated['password']),
                 'role'              => $role,
                 'email_verified_at' => now(),
-            ]);
+            ];
+            if (Schema::hasColumn('users', 'recovery_email')) {
+                $userData['recovery_email'] = $validated['recovery_email'] ?? null;
+            }
+
+            $user = User::create($userData);
 
             $customerData = [];
 
