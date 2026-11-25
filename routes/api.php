@@ -2405,6 +2405,172 @@ Route::post('/register', function (Request $request) use ($createNotification) {
     }
 });
 
+
+// =========================================================================
+// LOGIN / DAFTAR CEPAT VIA GOOGLE (AUTO-REGISTER JIKA USER BARU)
+// =========================================================================
+Route::post('/google-login', function (Request $request) use ($createNotification) {
+    try {
+        $idToken = trim((string) $request->input('id_token', ''));
+        if ($idToken === '') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Token Google tidak ditemukan.',
+            ], 422);
+        }
+
+        // Verifikasi token Google langsung ke server Google
+        $googleRes = Http::timeout(10)->get('https://oauth2.googleapis.com/tokeninfo', [
+            'id_token' => $idToken,
+        ]);
+
+        if (!$googleRes->successful()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Token Google tidak valid atau sudah kedaluwarsa.',
+            ], 401);
+        }
+
+        $gData = $googleRes->json();
+        $expectedClientId = '239418401389-olhf9hrkv5rm246pkee3gpl1me0b1uci.apps.googleusercontent.com';
+
+        if (($gData['aud'] ?? '') !== $expectedClientId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Client ID Google tidak cocok dengan aplikasi ini.',
+            ], 401);
+        }
+
+        $email = strtolower(trim((string) ($gData['email'] ?? $request->input('email', ''))));
+        $nama  = trim((string) ($gData['name'] ?? $request->input('name', 'Customer Google')));
+
+        if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Alamat email Google tidak valid.',
+            ], 422);
+        }
+
+        // Pastikan kolom recovery_email tersedia
+        try {
+            if (!Schema::hasColumn('users', 'recovery_email')) {
+                Schema::table('users', function ($table) {
+                    $table->string('recovery_email')->nullable()->after('email');
+                });
+            }
+        } catch (\Throwable $schemaErr) {}
+
+        $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
+        if (!$user && Schema::hasColumn('users', 'recovery_email')) {
+            $user = User::whereRaw('LOWER(recovery_email) = ?', [$email])->first();
+        }
+
+        $customer = null;
+        $userBaru = false;
+
+        if (!$user) {
+            // USER BARU -> Otomatis daftarkan ke tabel users & customers
+            $userBaru = true;
+            $result = DB::transaction(function () use ($nama, $email) {
+                $userData = [
+                    'name'              => $nama !== '' ? $nama : 'Customer Google',
+                    'email'             => $email,
+                    'password'          => bcrypt(Str::random(24)),
+                    'role'              => 'customer',
+                    'email_verified_at' => now(),
+                ];
+                if (Schema::hasColumn('users', 'recovery_email')) {
+                    $userData['recovery_email'] = $email;
+                }
+
+                $newUser = User::create($userData);
+
+                $customerData = [];
+                if (Schema::hasColumn('customers', 'nama')) {
+                    $customerData['nama'] = $newUser->name;
+                } elseif (Schema::hasColumn('customers', 'name')) {
+                    $customerData['name'] = $newUser->name;
+                }
+                if (Schema::hasColumn('customers', 'user_id')) $customerData['user_id'] = $newUser->id;
+                if (Schema::hasColumn('customers', 'email')) $customerData['email'] = $newUser->email;
+                if (Schema::hasColumn('customers', 'no_wa')) $customerData['no_wa'] = '';
+                if (Schema::hasColumn('customers', 'no_hp')) $customerData['no_hp'] = '';
+                if (Schema::hasColumn('customers', 'status')) $customerData['status'] = 'INACTIVE';
+                if (Schema::hasColumn('customers', 'status_koneksi')) $customerData['status_koneksi'] = 'Offline';
+                if (Schema::hasColumn('customers', 'nama_paket')) $customerData['nama_paket'] = null;
+                if (Schema::hasColumn('customers', 'product_id')) {
+                    $defaultProd = Product::first();
+                    $customerData['product_id'] = $defaultProd ? $defaultProd->id : 1;
+                }
+
+                $newCustomer = Customer::create($customerData);
+
+                return ['user' => $newUser, 'customer' => $newCustomer];
+            });
+
+            $user     = $result['user'];
+            $customer = $result['customer'];
+
+            $createNotification(
+                $user->id,
+                'customer',
+                'Selamat Datang di Portal Pelanggan',
+                "Halo {$user->name}, akun Google Anda berhasil terdaftar. Silakan pilih paket internet untuk mulai berlangganan.",
+                'INFO'
+            );
+            $createNotification(
+                null,
+                'admin',
+                'Pelanggan Baru (Google)',
+                "Pelanggan baru {$user->name} ({$user->email}) mendaftar cepat menggunakan akun Google.",
+                'INFO'
+            );
+        } else {
+            // USER LAMA -> Ambil data customer yang terhubung
+            if (Schema::hasColumn('customers', 'user_id')) {
+                $customer = Customer::where('user_id', $user->id)->first();
+            }
+            if (!$customer && Schema::hasColumn('customers', 'email') && !empty($user->email)) {
+                $customer = Customer::where('email', $user->email)->first();
+            }
+            if (!$customer && Schema::hasColumn('customers', 'nama') && !empty($user->name)) {
+                $customer = Customer::where('nama', $user->name)->first();
+            }
+        }
+
+        $token = null;
+        try {
+            if (method_exists($user, 'createToken')) {
+                $token = $user->createToken('auth_token')->plainTextToken;
+            }
+        } catch (\Throwable $tokErr) {}
+
+        if (empty($token)) {
+            $token = Str::random(64);
+        }
+
+        return response()->json([
+            'success'  => true,
+            'is_new'   => $userBaru,
+            'message'  => $userBaru ? 'Pendaftaran dengan Google berhasil!' : 'Login Google berhasil!',
+            'token'    => $token,
+            'user'     => [
+                'id'          => $user->id,
+                'customer_id' => $customer ? $customer->id : $user->id,
+                'name'        => $user->name,
+                'email'       => $user->email,
+                'phone'       => $customer->no_wa ?? $customer->no_hp ?? '',
+                'role'        => $user->role ?? 'customer',
+            ],
+        ], 200);
+    } catch (\Throwable $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Gagal login Google: ' . $e->getMessage(),
+        ], 500);
+    }
+});
+
 // Logout
 Route::post('/logout', function (Request $request) {
     try {
