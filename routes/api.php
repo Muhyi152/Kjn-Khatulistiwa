@@ -24,6 +24,10 @@ use App\Models\Product;
 
 date_default_timezone_set('Asia/Jakarta');
 
+$safeErrorMessage = function (\Throwable $e, string $fallback = 'Terjadi kesalahan pada server.') {
+    return config('app.debug') ? $e->getMessage() : $fallback;
+};
+
 // =========================================================================
 // HELPER GLOBAL: RESOLVE CURRENT USER DARI AUTH / BEARER TOKEN
 // =========================================================================
@@ -52,42 +56,45 @@ $checkIsAdmin = function (Request $request = null, $identifier = null) use ($res
             if (str_contains($path, 'admin')) return true;
             if (str_contains($path, 'customer/')) return false;
 
-            $headerRole = $request->header('X-User-Role') ?? $request->header('Role') ?? $request->header('role');
-            if ($headerRole) {
-                $hr = strtolower(trim((string)$headerRole));
-                if (in_array($hr, ['admin', 'administrator'])) return true;
-                if (in_array($hr, ['customer', 'pelanggan', 'user'])) return false;
-            }
-
-            $role = $request->query('role') ?? $request->input('role');
-            if ($role) {
-                $r = strtolower(trim((string)$role));
-                if (in_array($r, ['admin', 'administrator'])) return true;
-                if (in_array($r, ['customer', 'pelanggan', 'user'])) return false;
-            }
-
+            // Prioritaskan user terautentikasi dari Bearer Token (tidak bisa dipalsukan client)
             $user = $resolveCurrentUser($request);
             if ($user) {
                 $uRole = strtolower(trim($user->role ?? ''));
                 if (in_array($uRole, ['admin', 'administrator'])) return true;
-                if (in_array($uRole, ['customer', 'pelanggan', 'user'])) return false;
+                return false;
             }
 
+            // Cek ke database jika ada user_id / email
             $idVal = $identifier
                 ?? $request->query('user_id')
                 ?? $request->input('user_id')
                 ?? $request->header('X-User-Id')
                 ?? $request->query('email')
                 ?? $request->input('email');
-        } else {
-            $idVal = $identifier;
-        }
 
-        if (!empty($idVal)) {
-            if (!is_numeric($idVal) && str_contains(strtolower((string)$idVal), 'admin')) {
-                return true;
+            if (!empty($idVal)) {
+                $dbUser = is_numeric($idVal) ? User::find($idVal) : User::where('email', $idVal)->first();
+                if ($dbUser) {
+                    return in_array(strtolower(trim($dbUser->role ?? '')), ['admin', 'administrator']);
+                }
             }
-            $user = is_numeric($idVal) ? User::find($idVal) : User::where('email', $idVal)->first();
+
+            // Fallback sementara jika Flutter belum mengirim token pada endpoint tertentu
+            $headerRole = $request->header('X-User-Role') ?? $request->header('Role') ?? $request->header('role');
+            if ($headerRole) {
+                $hr = strtolower(trim((string) $headerRole));
+                if (in_array($hr, ['admin', 'administrator'])) return true;
+                if (in_array($hr, ['customer', 'pelanggan', 'user'])) return false;
+            }
+
+            $role = $request->query('role') ?? $request->input('role');
+            if ($role) {
+                $r = strtolower(trim((string) $role));
+                if (in_array($r, ['admin', 'administrator'])) return true;
+                if (in_array($r, ['customer', 'pelanggan', 'user'])) return false;
+            }
+        } elseif (!empty($identifier)) {
+            $user = is_numeric($identifier) ? User::find($identifier) : User::where('email', $identifier)->first();
             if ($user) {
                 return in_array(strtolower(trim($user->role ?? '')), ['admin', 'administrator']);
             }
@@ -290,7 +297,6 @@ $createNotification = function (?int $userId, string $roleTarget, string $title,
         try {
             DB::table('notifications')->insert($payload);
         } catch (\Throwable $insertErr) {
-            // Fallback jika kolom user_id di DB diset NOT NULL (tidak nullable)
             if ($userId === null) {
                 $adminUserId = User::whereIn(DB::raw('LOWER(role)'), ['admin', 'administrator'])->value('id') ?? 1;
                 $payload['user_id'] = $adminUserId;
@@ -506,9 +512,8 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
 // =========================================================================
 // HANDLER DASHBOARD ADMIN (AUTO-SYNC PRODUK, HARIAN & BULANAN RIIL WIB)
 // =========================================================================
-$handlerAdminDashboard = function (Request $request) use ($resolveProductFromInvoice) {
+$handlerAdminDashboard = function (Request $request) use ($resolveProductFromInvoice, $safeErrorMessage) {
     try {
-        // 1. AUTO-SYNC: Pastikan Produk ke-4 (Starter Kost Hemat) ada di Database
         $starterQuery = Product::query();
         $hasNamaPaket = Schema::hasColumn('products', 'nama_paket');
         $hasName      = Schema::hasColumn('products', 'name');
@@ -543,7 +548,6 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
         $allProducts = Product::orderBy('id', 'asc')->get();
         $totalProductsCount = (int) $allProducts->count();
 
-        // 2. Data Pelanggan
         $allCustomers = Customer::orderBy('id', 'desc')->get();
         $customersById = $allCustomers->keyBy('id');
         $totalCustomers = (int) $allCustomers->count();
@@ -558,7 +562,6 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
         if ($activeConnections === 0 && $totalCustomers > 0) $activeConnections = $totalCustomers;
         $isolatedCustomers = max(0, $totalCustomers - $activeConnections);
 
-        // 3. Data Tagihan & Omset
         $allInvoices = Invoice::orderBy('id', 'desc')->get();
         $paidInvoices = $allInvoices->filter(function ($inv) {
             return in_array(strtoupper(trim($inv->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
@@ -570,7 +573,6 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
             return in_array(strtoupper(trim($inv->status ?? '')), ['PENDING', 'UNPAID', 'BELUM_BAYAR']);
         })->count();
 
-        // 4. Distribusi Produk Berdasarkan Invoice Lunas
         $soldCountByProdId = [];
         $totalTerjual = 0;
 
@@ -610,7 +612,6 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
             $colorIdx++;
         }
 
-        // 5. Tren Pendapatan 6 Bulan Terakhir (WIB)
         $now = Carbon::now('Asia/Jakarta');
         $groupedByMonth = [];
 
@@ -645,7 +646,6 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
         ksort($groupedByMonth);
         $revenueMonthly = array_values($groupedByMonth);
 
-        // 6. Pendapatan Hari Ini & Grafik Harian (Senin - Minggu, Reset Otomatis Ganti Hari 00:00 WIB)
         $todayStr = $now->toDateString();
         $startOfWeek = $now->copy()->startOfWeek(Carbon::MONDAY)->startOfDay();
         $labelHari = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'];
@@ -703,7 +703,8 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
         return response()->json(array_merge(['success' => true], $statsData, ['data' => $statsData]), 200);
 
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error dashboard admin: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 };
 
@@ -724,7 +725,7 @@ Route::get('/dashboard', function (Request $r) use ($resolveCustomer, $formatCus
 // =========================================================================
 // ROUTE MUTASI ADMIN & CUSTOMER
 // =========================================================================
-$handlerMutasiAdmin = function (Request $request) use ($resolveProductFromInvoice) {
+$handlerMutasiAdmin = function (Request $request) use ($resolveProductFromInvoice, $safeErrorMessage) {
     try {
         $invoices = Invoice::orderByDesc('id')->get();
         $customerIds = $invoices->pluck('customer_id')->filter()->unique();
@@ -803,11 +804,12 @@ $handlerMutasiAdmin = function (Request $request) use ($resolveProductFromInvoic
         ], $summaryData), 200);
 
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error mutasi admin: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 };
 
-$handlerMutasiCustomer = function (Request $request, $idParam = null) use ($resolveCustomer, $resolveProductFromInvoice) {
+$handlerMutasiCustomer = function (Request $request, $idParam = null) use ($resolveCustomer, $resolveProductFromInvoice, $safeErrorMessage) {
     try {
         $customer = !empty($idParam) ? $resolveCustomer($idParam) : null;
         if (!$customer) {
@@ -882,7 +884,8 @@ $handlerMutasiCustomer = function (Request $request, $idParam = null) use ($reso
             'mutasi'             => $list,
         ], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error mutasi customer: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 };
 
@@ -973,7 +976,7 @@ $formatNotifRow = function ($row, $ticketsMap = null) {
     ];
 };
 
-$handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $extractTicketMapFromRows, $syncOldInvoicesIfEmpty) {
+$handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $extractTicketMapFromRows, $syncOldInvoicesIfEmpty, $safeErrorMessage) {
     try {
         $syncOldInvoicesIfEmpty();
 
@@ -998,11 +1001,12 @@ $handlerAdminNotifications = function (Request $request) use ($formatNotifRow, $
             'notifications' => $notifications,
         ], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error notif admin: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 };
 
-$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $handlerAdminNotifications, $checkIsAdmin, $formatNotifRow, $extractTicketMapFromRows, $syncOldInvoicesIfEmpty) {
+$handlerCustomerNotifications = function (Request $request) use ($resolveCustomer, $handlerAdminNotifications, $checkIsAdmin, $formatNotifRow, $extractTicketMapFromRows, $syncOldInvoicesIfEmpty, $safeErrorMessage) {
     try {
         if ($checkIsAdmin($request)) {
             return $handlerAdminNotifications($request);
@@ -1051,7 +1055,8 @@ $handlerCustomerNotifications = function (Request $request) use ($resolveCustome
             'notifications' => $notifications,
         ], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error notif customer: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 };
 
@@ -1176,7 +1181,7 @@ $ensureTicketsTable = function () {
             $table->string('nama_paket')->nullable();
             $table->string('kategori', 100);
             $table->text('pesan');
-            $table->string('status', 30)->default('MENUNGGU'); // MENUNGGU, DIPROSES, SELESAI
+            $table->string('status', 30)->default('MENUNGGU');
             $table->text('balasan_admin')->nullable();
             $table->timestamps();
         });
@@ -1184,7 +1189,7 @@ $ensureTicketsTable = function () {
 };
 
 // GET: Daftar Tiket Customer
-Route::get('/customer/tickets', function (Request $request) use ($ensureTicketsTable, $resolveCustomer) {
+Route::get('/customer/tickets', function (Request $request) use ($ensureTicketsTable, $resolveCustomer, $safeErrorMessage) {
     try {
         $ensureTicketsTable();
         $customer = $resolveCustomer($request);
@@ -1209,12 +1214,13 @@ Route::get('/customer/tickets', function (Request $request) use ($ensureTicketsT
 
         return response()->json(['success' => true, 'data' => $rows], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error get tickets customer: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 });
 
 // POST: Customer Membuat Tiket Baru -> Otomatis Notifikasi ke Admin
-Route::post('/customer/tickets', function (Request $request) use ($ensureTicketsTable, $resolveCustomer, $resolveCustomerUserId, $createNotification) {
+Route::post('/customer/tickets', function (Request $request) use ($ensureTicketsTable, $resolveCustomer, $resolveCustomerUserId, $createNotification, $safeErrorMessage) {
     try {
         $ensureTicketsTable();
         $customer = $resolveCustomer($request);
@@ -1222,8 +1228,8 @@ Route::post('/customer/tickets', function (Request $request) use ($ensureTickets
             return response()->json(['success' => false, 'message' => 'Data pelanggan tidak ditemukan.'], 404);
         }
 
-        $kategori = trim((string) $request->input('kategori', 'Kendala Jaringan'));
-        $pesan    = trim((string) $request->input('pesan', ''));
+        $kategori = mb_substr(trim((string) $request->input('kategori', 'Kendala Jaringan')), 0, 100);
+        $pesan    = mb_substr(trim((string) $request->input('pesan', '')), 0, 2000);
 
         if ($pesan === '') {
             return response()->json(['success' => false, 'message' => 'Deskripsi keluhan/pengajuan wajib diisi.'], 422);
@@ -1250,7 +1256,6 @@ Route::post('/customer/tickets', function (Request $request) use ($ensureTickets
             'updated_at'    => now(),
         ]);
 
-        // Kirim notifikasi ke Admin
         $createNotification(
             null,
             'admin',
@@ -1265,12 +1270,13 @@ Route::post('/customer/tickets', function (Request $request) use ($ensureTickets
             'data'    => DB::table('tickets')->where('id', $id)->first(),
         ], 201);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error create ticket: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
-});
+})->middleware('throttle:15,1');
 
 // GET: Daftar Semua Tiket untuk Admin
-Route::get('/admin/tickets', function () use ($ensureTicketsTable) {
+Route::get('/admin/tickets', function () use ($ensureTicketsTable, $safeErrorMessage) {
     try {
         $ensureTicketsTable();
         $rows = DB::table('tickets')->orderByDesc('id')->get();
@@ -1282,12 +1288,13 @@ Route::get('/admin/tickets', function () use ($ensureTicketsTable) {
             'data'          => $rows,
         ], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error get admin tickets: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 });
 
 // POST: Admin Update Status & Balas Tiket -> Otomatis Notifikasi ke Customer
-Route::post('/admin/tickets/{id}/update', function (Request $request, $id) use ($ensureTicketsTable, $createNotification) {
+Route::post('/admin/tickets/{id}/update', function (Request $request, $id) use ($ensureTicketsTable, $createNotification, $safeErrorMessage) {
     try {
         $ensureTicketsTable();
         $ticket = DB::table('tickets')->where('id', $id)->first();
@@ -1300,7 +1307,7 @@ Route::post('/admin/tickets/{id}/update', function (Request $request, $id) use (
             $status = 'DIPROSES';
         }
 
-        $balasan = trim((string) $request->input('balasan_admin', ''));
+        $balasan = mb_substr(trim((string) $request->input('balasan_admin', '')), 0, 2000);
 
         DB::table('tickets')->where('id', $id)->update([
             'status'        => $status,
@@ -1308,7 +1315,6 @@ Route::post('/admin/tickets/{id}/update', function (Request $request, $id) use (
             'updated_at'    => now(),
         ]);
 
-        // Kirim notifikasi update ke Customer terkait
         $notifType = $status === 'SELESAI' ? 'SUCCESS' : 'INFO';
         $pesanNotif = "Status tiket {$ticket->nomor_tiket} ({$ticket->kategori}) diperbarui menjadi {$status}."
             . ($balasan !== '' ? " Catatan Admin: {$balasan}" : '');
@@ -1327,7 +1333,8 @@ Route::post('/admin/tickets/{id}/update', function (Request $request, $id) use (
             'data'    => DB::table('tickets')->where('id', $id)->first(),
         ], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error update ticket: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 });
 
@@ -1338,15 +1345,15 @@ Route::get('/customer/profile/{identifier}', function ($identifier) use ($resolv
 });
 
 // Update Kontak Customer (Hanya Nama & No. WhatsApp/HP)
-Route::post('/customer/profile/update', function (Request $request) use ($resolveCustomer) {
+Route::post('/customer/profile/update', function (Request $request) use ($resolveCustomer, $safeErrorMessage) {
     try {
         $customer = $resolveCustomer($request);
         if (!$customer) {
             return response()->json(['success' => false, 'message' => 'Data pelanggan tidak ditemukan.'], 404);
         }
 
-        $nama = trim((string) $request->input('nama', ''));
-        $noHp = trim((string) ($request->input('no_hp') ?? $request->input('no_wa') ?? ''));
+        $nama = mb_substr(trim((string) $request->input('nama', '')), 0, 150);
+        $noHp = mb_substr(trim((string) ($request->input('no_hp') ?? $request->input('no_wa') ?? '')), 0, 30);
 
         if ($nama === '' || $noHp === '') {
             return response()->json(['success' => false, 'message' => 'Nama dan No. WhatsApp wajib diisi.'], 422);
@@ -1362,7 +1369,6 @@ Route::post('/customer/profile/update', function (Request $request) use ($resolv
             $customer->update($custUpdate);
         }
 
-        // Sinkronkan nama ke tabel users juga jika terhubung
         if (!empty($customer->user_id)) {
             User::where('id', $customer->user_id)->update(['name' => $nama]);
         }
@@ -1372,7 +1378,8 @@ Route::post('/customer/profile/update', function (Request $request) use ($resolv
             'message' => 'Profil kontak berhasil diperbarui!',
         ], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error update profile: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 });
 
@@ -1384,7 +1391,7 @@ Route::get('/customers/{id}', function ($id) use ($resolveCustomer, $formatCusto
 // =========================================================================
 // HANDLER UPDATE PELANGGAN (ADMIN) - FIX USERNAME PPPoE, ALAMAT & STATUS
 // =========================================================================
-$handlerUpdateCustomer = function (Request $request, $id = null) {
+$handlerUpdateCustomer = function (Request $request, $id = null) use ($safeErrorMessage) {
     try {
         $targetId = $id ?? $request->input('id') ?? $request->input('customer_id');
         if (empty($targetId)) {
@@ -1402,7 +1409,6 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
             ], 404);
         }
 
-        // Pastikan kolom pppoe_username & alamat tersedia jika sebelumnya belum ada di tabel
         try {
             if (!Schema::hasColumn('customers', 'pppoe_username') && !Schema::hasColumn('customers', 'username_pppoe')) {
                 Schema::table('customers', function ($table) {
@@ -1419,9 +1425,8 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
         $updateData = [];
         $namaClean = null;
 
-        // 1. Nama Pelanggan
         if ($request->hasAny(['nama', 'name', 'nama_pelanggan'])) {
-            $namaClean = trim((string) ($request->input('nama') ?? $request->input('name') ?? $request->input('nama_pelanggan') ?? ''));
+            $namaClean = mb_substr(trim((string) ($request->input('nama') ?? $request->input('name') ?? $request->input('nama_pelanggan') ?? '')), 0, 150);
             if ($namaClean === '') {
                 return response()->json([
                     'success' => false,
@@ -1432,26 +1437,23 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
             if (Schema::hasColumn('customers', 'name')) $updateData['name'] = $namaClean;
         }
 
-        // 2. No. WhatsApp / HP
         if ($request->hasAny(['no_hp', 'no_wa', 'phone', 'telepon', 'no_telp'])) {
-            $hpInput = trim((string) ($request->input('no_hp') ?? $request->input('no_wa') ?? $request->input('phone') ?? $request->input('telepon') ?? $request->input('no_telp') ?? ''));
+            $hpInput = mb_substr(trim((string) ($request->input('no_hp') ?? $request->input('no_wa') ?? $request->input('phone') ?? $request->input('telepon') ?? $request->input('no_telp') ?? '')), 0, 30);
             if (Schema::hasColumn('customers', 'no_wa')) $updateData['no_wa'] = $hpInput;
             if (Schema::hasColumn('customers', 'no_hp')) $updateData['no_hp'] = $hpInput;
             if (Schema::hasColumn('customers', 'phone')) $updateData['phone'] = $hpInput;
         }
 
-        // 3. Username PPPoE
         if ($request->hasAny(['username_pppoe', 'pppoe_username', 'pppoe', 'username'])) {
-            $pppoeInput = trim((string) ($request->input('username_pppoe') ?? $request->input('pppoe_username') ?? $request->input('pppoe') ?? $request->input('username') ?? ''));
+            $pppoeInput = mb_substr(trim((string) ($request->input('username_pppoe') ?? $request->input('pppoe_username') ?? $request->input('pppoe') ?? $request->input('username') ?? '')), 0, 100);
             $pppoeVal = ($pppoeInput === '' || $pppoeInput === '-') ? null : $pppoeInput;
 
             if (Schema::hasColumn('customers', 'pppoe_username')) $updateData['pppoe_username'] = $pppoeVal;
             if (Schema::hasColumn('customers', 'username_pppoe')) $updateData['username_pppoe'] = $pppoeVal;
         }
 
-        // 4. Alamat Pemasangan
         if ($request->hasAny(['alamat', 'address', 'alamat_pemasangan'])) {
-            $alamatInput = trim((string) ($request->input('alamat') ?? $request->input('address') ?? $request->input('alamat_pemasangan') ?? ''));
+            $alamatInput = mb_substr(trim((string) ($request->input('alamat') ?? $request->input('address') ?? $request->input('alamat_pemasangan') ?? '')), 0, 500);
             $alamatVal = ($alamatInput === '' || $alamatInput === '-') ? null : $alamatInput;
 
             if (Schema::hasColumn('customers', 'alamat')) $updateData['alamat'] = $alamatVal;
@@ -1459,15 +1461,13 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
             if (Schema::hasColumn('customers', 'alamat_pemasangan')) $updateData['alamat_pemasangan'] = $alamatVal;
         }
 
-        // 5. Email (jika dikirim)
         if ($request->has('email') && Schema::hasColumn('customers', 'email')) {
             $emailInput = trim((string) $request->input('email', ''));
-            if ($emailInput !== '' && $emailInput !== '-') {
+            if ($emailInput !== '' && $emailInput !== '-' && filter_var($emailInput, FILTER_VALIDATE_EMAIL)) {
                 $updateData['email'] = $emailInput;
             }
         }
 
-        // 6. Pilihan Paket Internet (product_id & nama_paket)
         $productIdInput = $request->input('product_id') ?? $request->input('paket_id');
         $namaPaketInput = $request->input('nama_paket') ?? $request->input('paket');
 
@@ -1500,7 +1500,6 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
             }
         }
 
-        // 7. Status Langganan
         if ($request->hasAny(['status', 'status_langganan'])) {
             $rawStatus = strtoupper(trim((string) ($request->input('status') ?? $request->input('status_langganan') ?? '')));
             $isActiveStatus = (
@@ -1515,7 +1514,6 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
             if (Schema::hasColumn('customers', 'status')) {
                 $finalStatus = $isActiveStatus ? 'ACTIVE' : ($isIsolirStatus ? 'ISOLIR' : 'INACTIVE');
 
-                // Sesuaikan otomatis jika kolom status di MySQL bertipe ENUM
                 try {
                     $colInfo = DB::select("SHOW COLUMNS FROM customers LIKE 'status'");
                     if (!empty($colInfo)) {
@@ -1551,12 +1549,10 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
             $updateData['updated_at'] = now();
         }
 
-        // Update langsung via Query Builder agar tidak gagal karena $fillable pada Model Customer
         if (!empty($updateData)) {
             DB::table('customers')->where('id', $customer->id)->update($updateData);
         }
 
-        // Sinkronkan nama ke tabel users jika terhubung
         if (!empty($customer->user_id) && $namaClean !== null) {
             try {
                 User::where('id', $customer->user_id)->update(['name' => $namaClean]);
@@ -1589,7 +1585,7 @@ $handlerUpdateCustomer = function (Request $request, $id = null) {
         Log::error('Gagal update customer: ' . $e->getMessage());
         return response()->json([
             'success' => false,
-            'message' => 'Gagal memperbarui data pelanggan: ' . $e->getMessage(),
+            'message' => 'Gagal memperbarui data pelanggan: ' . $safeErrorMessage($e),
         ], 500);
     }
 };
@@ -1618,7 +1614,7 @@ Route::post('/admin/routers/{id}/action', [NetworkController::class, 'action']);
 Route::get('/admin/network-logs', [NetworkController::class, 'logs']);
 
 // Tagihan Aktif
-Route::get('/customer/invoice/active', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice) {
+Route::get('/customer/invoice/active', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice, $safeErrorMessage) {
     try {
         $cust = $resolveCustomer($request);
 
@@ -1667,16 +1663,26 @@ Route::get('/customer/invoice/active', function (Request $request) use ($resolve
             ],
         ], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error get active invoice: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 });
 
-// Xendit Create Invoice
-$handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer, $createNotification, $resolveCustomerUserId) {
+// Xendit Create Invoice (Wajib harga sesuai tabel products + Tanpa Key Hardcoded)
+$handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer, $createNotification, $resolveCustomerUserId, $safeErrorMessage) {
     try {
         $customer = $resolveCustomer($request);
         if (!$customer) {
             return response()->json(['success' => false, 'message' => 'Data customer tidak ditemukan di database.'], 404);
+        }
+
+        $secretKey = trim((string) (config('services.xendit.secret_key') ?: env('XENDIT_SECRET_KEY', '')));
+        if ($secretKey === '') {
+            Log::error('XENDIT_SECRET_KEY belum dikonfigurasi di environment server.');
+            return response()->json([
+                'success' => false,
+                'message' => 'Layanan pembayaran belum dikonfigurasi di server.',
+            ], 500);
         }
 
         $productId = $request->input('product_id');
@@ -1698,9 +1704,19 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer,
                     ->orWhere('name', $namaProdukInput)
                     ->first();
             }
+            if (!$product) {
+                $cleanLower = strtolower($cleanInput);
+                foreach (Product::all() as $p) {
+                    $pName = strtolower(trim((string) ($p->nama_paket ?? $p->name ?? '')));
+                    if ($pName !== '' && ($pName === $cleanLower || str_contains($cleanLower, $pName) || str_contains($pName, $cleanLower))) {
+                        $product = $p;
+                        break;
+                    }
+                }
+            }
         }
 
-        if (!$product && empty($namaProdukInput) && $nominalInput > 0) {
+        if (!$product && $nominalInput > 0) {
             foreach (Product::all() as $p) {
                 if ((int) ($p->harga ?? $p->price ?? 0) === $nominalInput) {
                     $product = $p;
@@ -1709,10 +1725,16 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer,
             }
         }
 
-        $nominal = $product ? (int) ($product->harga ?? $product->price ?? $nominalInput) : $nominalInput;
-        $namaPaket = $product
-            ? trim((string) ($product->nama_paket ?? $product->name ?? 'Paket Internet'))
-            : (!empty($namaProdukInput) ? $namaProdukInput : 'Paket Internet');
+        if (!$product) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Paket internet tidak ditemukan. Silakan pilih paket yang tersedia.',
+            ], 422);
+        }
+
+        // Selalu pakai harga resmi dari database, abaikan nominal yang dikirim client
+        $nominal = (int) ($product->harga ?? $product->price ?? 0);
+        $namaPaket = trim((string) ($product->nama_paket ?? $product->name ?? 'Paket Internet'));
 
         if ($nominal < 10000) {
             return response()->json([
@@ -1736,8 +1758,6 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer,
             ? $customer->email
             : 'pelanggan.' . $customer->id . '@gmail.com';
 
-        $secretKey = env('XENDIT_SECRET_KEY', 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa');
-
         $payloadXendit = [
             'external_id'      => $nomorInvoice,
             'amount'           => $nominal,
@@ -1757,14 +1777,21 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer,
             ->post('https://api.xendit.co/v2/invoices', $payloadXendit);
 
         if (!$response->successful()) {
+            Log::warning('Xendit create invoice ditolak: ' . $response->body());
             return response()->json([
                 'success' => false,
-                'message' => 'Xendit menolak pembuatan tagihan: ' . ($response->json('message') ?? $response->body())
+                'message' => 'Xendit menolak pembuatan tagihan: ' . ($response->json('message') ?? 'Permintaan ditolak')
             ], 400);
         }
 
         $resData = $response->json();
-        $invoiceUrl = $resData['invoice_url'];
+        $invoiceUrl = $resData['invoice_url'] ?? null;
+        if (empty($invoiceUrl)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'URL pembayaran Xendit tidak tersedia.',
+            ], 502);
+        }
 
         Invoice::where('customer_id', $customer->id)
             ->whereIn(DB::raw('UPPER(status)'), ['PENDING', 'UNPAID', 'BELUM_BAYAR'])
@@ -1783,7 +1810,6 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer,
 
         $invoice = Invoice::create($invoiceData);
 
-        // Simpan notifikasi tagihan baru untuk Customer & Admin ke MySQL
         $nominalFmt = 'Rp ' . number_format($nominal, 0, ',', '.');
         $namaCust   = $customer->nama ?? $customer->name ?? 'Pelanggan';
         $custUserId = $resolveCustomerUserId($customer);
@@ -1816,18 +1842,18 @@ $handlerCreateInvoiceXendit = function (Request $request) use ($resolveCustomer,
         ], 200);
 
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => 'Terjadi kesalahan sistem: ' . $e->getMessage()], 500);
+        Log::error('Error create invoice Xendit: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => 'Terjadi kesalahan sistem: ' . $safeErrorMessage($e)], 500);
     }
 };
 
-Route::post('/xendit/create-invoice', fn(Request $r) => $handlerCreateInvoiceXendit($r));
-Route::post('/xendit/create-qris', fn(Request $r) => $handlerCreateInvoiceXendit($r));
+Route::post('/xendit/create-invoice', fn(Request $r) => $handlerCreateInvoiceXendit($r))->middleware('throttle:15,1');
+Route::post('/xendit/create-qris', fn(Request $r) => $handlerCreateInvoiceXendit($r))->middleware('throttle:15,1');
 
-// Cek Status Pembayaran (Sekaligus sinkronkan paket aktif & buat notifikasi lunas)
-Route::post('/invoices/check-status', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice, $createNotification, $resolveCustomerUserId) {
+// Cek Status Pembayaran (TANPA celah simulasi, verifikasi asli ke Xendit dengan SSL aktif)
+Route::post('/invoices/check-status', function (Request $request) use ($resolveCustomer, $resolveProductFromInvoice, $createNotification, $resolveCustomerUserId, $safeErrorMessage) {
     try {
-        $nomorInvoice = trim($request->input('nomor_invoice', ''));
-        $simulasi = $request->boolean('simulasi', false);
+        $nomorInvoice = trim((string) $request->input('nomor_invoice', ''));
 
         $invoice = null;
         if (!empty($nomorInvoice)) {
@@ -1845,16 +1871,23 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
             return response()->json(['success' => false, 'message' => 'Tagihan tidak ditemukan.'], 404);
         }
 
-        $secretKey = env('XENDIT_SECRET_KEY', 'xnd_development_tItdOKcWdq44rpuVkqd1TC7qkouHdQkPrOIdKU6Ah7XC9YH6uQ6oc0qxNPCa');
+        $secretKey = trim((string) (config('services.xendit.secret_key') ?: env('XENDIT_SECRET_KEY', '')));
         $alreadyPaid = in_array(strtoupper(trim($invoice->status ?? '')), ['PAID', 'LUNAS', 'BERHASIL', 'SUCCESS']);
         $isPaid = $alreadyPaid;
 
-        if (!$isPaid && !empty($secretKey)) {
+        if (!$isPaid) {
+            if ($secretKey === '') {
+                Log::error('XENDIT_SECRET_KEY belum dikonfigurasi saat cek status invoice.');
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Konfigurasi gateway pembayaran belum lengkap di server.',
+                ], 500);
+            }
+
             try {
                 $response = Http::withBasicAuth($secretKey, '')
-                    ->withoutVerifying()
                     ->timeout(12)
-                    ->get('https://api.xendit.co/v2/invoices?external_id=' . $invoice->nomor_invoice);
+                    ->get('https://api.xendit.co/v2/invoices?external_id=' . urlencode($invoice->nomor_invoice));
 
                 if ($response->successful()) {
                     $res = $response->json();
@@ -1863,15 +1896,14 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
                         $isPaid = true;
                     }
                 }
-            } catch (\Throwable $err) {}
+            } catch (\Throwable $err) {
+                Log::warning('Gagal menghubungi Xendit check-status: ' . $err->getMessage());
+            }
         }
-
-        if ($simulasi) $isPaid = true;
 
         if ($isPaid) {
             $baruSajaLunas = !$alreadyPaid;
 
-            // Update langsung via DB::table agar tanggal_bayar pasti tersimpan walau tidak di $fillable
             if (!$alreadyPaid || empty($invoice->tanggal_bayar)) {
                 $nowWib = Carbon::now('Asia/Jakarta');
                 $updateInv = ['status' => 'PAID'];
@@ -1908,7 +1940,6 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
                 }
             }
 
-            // Simpan notifikasi lunas ke MySQL hanya sekali saat status berubah menjadi PAID
             if ($baruSajaLunas) {
                 $namaPaketClean = preg_replace(
                     '/^Pembayaran\s+Paket\s+/i',
@@ -1948,15 +1979,16 @@ Route::post('/invoices/check-status', function (Request $request) use ($resolveC
 
         return response()->json(['success' => false, 'is_paid' => false, 'status' => 'PENDING'], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error check-status invoice: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
-});
+})->middleware('throttle:30,1');
 
 // Cancel Invoice
-Route::post('/invoices/cancel', function (Request $request) use ($resolveCustomer) {
+Route::post('/invoices/cancel', function (Request $request) use ($resolveCustomer, $safeErrorMessage) {
     try {
         $customer = $resolveCustomer($request);
-        $nomorInvoice = trim($request->input('nomor_invoice', ''));
+        $nomorInvoice = trim((string) $request->input('nomor_invoice', ''));
 
         if (!empty($nomorInvoice)) {
             Invoice::where('nomor_invoice', $nomorInvoice)
@@ -1973,14 +2005,15 @@ Route::post('/invoices/cancel', function (Request $request) use ($resolveCustome
 
         return response()->json(['success' => true, 'message' => 'Tagihan dibatalkan.'], 200);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        Log::error('Error cancel invoice: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => $safeErrorMessage($e)], 500);
     }
 });
 
 // =========================================================================
 // LOGIN
 // =========================================================================
-Route::post('/login', function (Request $request) {
+Route::post('/login', function (Request $request) use ($safeErrorMessage) {
     try {
         $credentials = $request->validate([
             'email'    => 'required|email',
@@ -2036,14 +2069,15 @@ Route::post('/login', function (Request $request) {
     } catch (\Illuminate\Validation\ValidationException $ve) {
         return response()->json(['success' => false, 'message' => $ve->validator->errors()->first()], 422);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => 'Terjadi kesalahan sistem: ' . $e->getMessage()], 500);
+        Log::error('Error login: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => 'Terjadi kesalahan sistem: ' . $safeErrorMessage($e)], 500);
     }
-});
+})->middleware('throttle:10,1');
 
-/// =========================================================================
+// =========================================================================
 // LUPA PASSWORD (CARI USERNAME / PPPOE / EMAIL -> KIRIM PASSWORD VIA BREVO API)
 // =========================================================================
-Route::post('/forgot-password', function (Request $request) {
+Route::post('/forgot-password', function (Request $request) use ($safeErrorMessage) {
     try {
         $identifier = trim((string) (
             $request->input('identifier')
@@ -2059,7 +2093,6 @@ Route::post('/forgot-password', function (Request $request) {
             ], 422);
         }
 
-        // Pastikan kolom recovery_email tersedia di tabel users jika belum dimigrasi
         try {
             if (!Schema::hasColumn('users', 'recovery_email')) {
                 Schema::table('users', function ($table) {
@@ -2072,7 +2105,6 @@ Route::post('/forgot-password', function (Request $request) {
         $user     = null;
         $customer = null;
 
-        // 1. Cari di tabel users: email -> recovery_email -> username (jika ada)
         $user = User::whereRaw('LOWER(email) = ?', [$idLower])->first();
 
         if (!$user && Schema::hasColumn('users', 'recovery_email')) {
@@ -2083,7 +2115,6 @@ Route::post('/forgot-password', function (Request $request) {
             $user = User::whereRaw('LOWER(username) = ?', [$idLower])->first();
         }
 
-        // 2. Jika belum ketemu, cari di tabel customers: pppoe_username / username_pppoe / email
         if (!$user && Schema::hasTable('customers')) {
             if (Schema::hasColumn('customers', 'pppoe_username')) {
                 $customer = Customer::whereRaw('LOWER(pppoe_username) = ?', [$idLower])->first();
@@ -2096,7 +2127,6 @@ Route::post('/forgot-password', function (Request $request) {
             }
         }
 
-        // 3. Fallback terakhir: cari berdasarkan nama di users atau customers
         if (!$user && !$customer) {
             $user = User::whereRaw('LOWER(name) = ?', [$idLower])->first();
         }
@@ -2109,7 +2139,6 @@ Route::post('/forgot-password', function (Request $request) {
             }
         }
 
-        // Hubungkan customer -> user jika yang ketemu baru data customer
         if (!$user && $customer) {
             if (!empty($customer->user_id)) {
                 $user = User::find($customer->user_id);
@@ -2125,7 +2154,6 @@ Route::post('/forgot-password', function (Request $request) {
             }
         }
 
-        // Hubungkan user -> customer (untuk fallback email jika diperlukan)
         if ($user && !$customer && Schema::hasTable('customers')) {
             if (Schema::hasColumn('customers', 'user_id')) {
                 $customer = Customer::where('user_id', $user->id)->first();
@@ -2142,7 +2170,6 @@ Route::post('/forgot-password', function (Request $request) {
             ], 404);
         }
 
-        // Tentukan email tujuan (prioritaskan recovery_email, lalu email utama)
         $kandidatEmail = [
             $user->recovery_email ?? null,
             $customer->recovery_email ?? null,
@@ -2166,9 +2193,8 @@ Route::post('/forgot-password', function (Request $request) {
             ], 422);
         }
 
-        $brevoApiKey = trim((string) env('BREVO_API_KEY', ''));
+        $brevoApiKey = trim((string) (config('services.brevo.key') ?: env('BREVO_API_KEY', '')));
 
-        // Jika BREVO_API_KEY belum disetting, cek apakah SMTP biasa aktif
         if ($brevoApiKey === '' && in_array(config('mail.default'), ['log', 'array'], true)) {
             return response()->json([
                 'success' => false,
@@ -2176,23 +2202,21 @@ Route::post('/forgot-password', function (Request $request) {
             ], 500);
         }
 
-        // Generate password baru acak 8 karakter (mudah dibaca, tanpa karakter mirip O/0/l/1)
         $karakter = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
         $passwordBaru = '';
         for ($i = 0; $i < 8; $i++) {
             $passwordBaru .= $karakter[random_int(0, strlen($karakter) - 1)];
         }
 
-        $fromEmail = trim((string) env('MAIL_FROM_ADDRESS', ''));
+        $fromEmail = trim((string) (config('mail.from.address') ?: env('MAIL_FROM_ADDRESS', '')));
         if ($fromEmail === '' || $fromEmail === 'hello@example.com') {
             $fromEmail = 'kjnkhatulistiwa@gmail.com';
         }
-        $fromName = trim((string) env('MAIL_FROM_NAME', 'BUMDES Khatulistiwa'));
+        $fromName = trim((string) (config('mail.from.name') ?: env('MAIL_FROM_NAME', 'BUMDES Khatulistiwa')));
         if ($fromName === '' || str_contains($fromName, '${')) {
             $fromName = 'BUMDES Khatulistiwa';
         }
 
-        // Gunakan transaction: password hanya tersimpan jika email benar-benar terkirim
         DB::beginTransaction();
         try {
             DB::table('users')
@@ -2247,11 +2271,10 @@ Route::post('/forgot-password', function (Request $request) {
 
             return response()->json([
                 'success' => false,
-                'message' => 'Gagal mengirim email ke pengguna: ' . $mailErr->getMessage(),
+                'message' => 'Gagal mengirim email ke pengguna: ' . $safeErrorMessage($mailErr, 'Layanan email sedang bermasalah.'),
             ], 500);
         }
 
-        // Sensor alamat email di response untuk keamanan (contoh: nu***@gmail.com)
         [$local, $domain] = array_pad(explode('@', $targetEmail, 2), 2, '');
         $maskedLocal = strlen($local) > 2
             ? substr($local, 0, 2) . str_repeat('*', max(3, strlen($local) - 2))
@@ -2267,25 +2290,24 @@ Route::post('/forgot-password', function (Request $request) {
         Log::error('Error forgot-password: ' . $e->getMessage());
         return response()->json([
             'success' => false,
-            'message' => 'Terjadi kesalahan sistem: ' . $e->getMessage(),
+            'message' => 'Terjadi kesalahan sistem: ' . $safeErrorMessage($e),
         ], 500);
     }
-});
+})->middleware('throttle:5,1');
 
 // =========================================================================
-// REGISTER (CUSTOMER BARU + NOTIFIKASI KE ADMIN & CUSTOMER)
+// REGISTER (CUSTOMER BARU + KUNCI ROLE CUSTOMER)
 // =========================================================================
-Route::post('/register', function (Request $request) use ($createNotification) {
+Route::post('/register', function (Request $request) use ($createNotification, $safeErrorMessage) {
     try {
         $validated = $request->validate([
             'name'           => 'required|string|max:255',
             'email'          => 'required|email|max:255|unique:users,email',
             'recovery_email' => 'nullable|email|max:255',
             'password'       => 'required|string|min:6',
-            'phone'          => 'nullable|string',
+            'phone'          => 'nullable|string|max:30',
         ]);
 
-        // Otomatis pastikan kolom recovery_email tersedia di tabel users
         try {
             if (!Schema::hasColumn('users', 'recovery_email')) {
                 Schema::table('users', function ($table) {
@@ -2294,8 +2316,9 @@ Route::post('/register', function (Request $request) use ($createNotification) {
             }
         } catch (\Throwable $schemaErr) {}
 
-        $role = strtolower(trim($request->input('role', 'customer')));
-        $noHp = $request->input('phone') ?? $request->input('no_hp') ?? '';
+        // Selalu paksa role 'customer' untuk pendaftaran publik (cegah privilege escalation)
+        $role = 'customer';
+        $noHp = mb_substr(trim((string) ($request->input('phone') ?? $request->input('no_hp') ?? '')), 0, 30);
 
         $result = DB::transaction(function () use ($validated, $role, $noHp, $request) {
             $userData = [
@@ -2356,7 +2379,6 @@ Route::post('/register', function (Request $request) use ($createNotification) {
         $user = $result['user'];
         $customer = $result['customer'];
 
-        // Simpan notifikasi pendaftaran untuk Customer & Admin
         $createNotification(
             $user->id,
             'customer',
@@ -2401,14 +2423,15 @@ Route::post('/register', function (Request $request) use ($createNotification) {
     } catch (\Illuminate\Validation\ValidationException $ve) {
         return response()->json(['success' => false, 'message' => $ve->validator->errors()->first()], 422);
     } catch (\Throwable $e) {
-        return response()->json(['success' => false, 'message' => 'Pendaftaran gagal: ' . $e->getMessage()], 500);
+        Log::error('Error register: ' . $e->getMessage());
+        return response()->json(['success' => false, 'message' => 'Pendaftaran gagal: ' . $safeErrorMessage($e)], 500);
     }
-});
+})->middleware('throttle:10,1');
 
 // =========================================================================
 // LOGIN / DAFTAR CEPAT VIA GOOGLE (AUTO-REGISTER JIKA USER BARU)
 // =========================================================================
-Route::post('/google-login', function (Request $request) use ($createNotification) {
+Route::post('/google-login', function (Request $request) use ($createNotification, $safeErrorMessage) {
     try {
         $idToken = trim((string) $request->input('id_token', ''));
         if ($idToken === '') {
@@ -2418,7 +2441,6 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
             ], 422);
         }
 
-        // Verifikasi token Google langsung ke server Google
         $googleRes = Http::timeout(10)->get('https://oauth2.googleapis.com/tokeninfo', [
             'id_token' => $idToken,
         ]);
@@ -2432,7 +2454,8 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
         }
 
         $gData = $googleRes->json();
-        $expectedClientId = '239418401389-olhf9hrkv5rm246pkee3gpl1me0b1uci.apps.googleusercontent.com';
+        $expectedClientId = config('services.google.client_id')
+            ?: env('GOOGLE_CLIENT_ID', '239418401389-olhf9hrkv5rm246pkee3gpl1me0b1uci.apps.googleusercontent.com');
 
         if (($gData['aud'] ?? '') !== $expectedClientId) {
             Log::warning('Google aud mismatch', ['aud' => $gData['aud'] ?? null]);
@@ -2442,8 +2465,16 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
             ], 401);
         }
 
-        $email = strtolower(trim((string) ($gData['email'] ?? $request->input('email', ''))));
-        $nama  = trim((string) ($gData['name'] ?? $request->input('name', 'Customer Google')));
+        $emailVerified = filter_var($gData['email_verified'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if (!$emailVerified) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Email akun Google belum terverifikasi.',
+            ], 401);
+        }
+
+        $email = strtolower(trim((string) ($gData['email'] ?? '')));
+        $nama  = mb_substr(trim((string) ($gData['name'] ?? $request->input('name', 'Customer Google'))), 0, 150);
 
         if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             return response()->json([
@@ -2452,7 +2483,6 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
             ], 422);
         }
 
-        // Pastikan kolom recovery_email tersedia
         try {
             if (!Schema::hasColumn('users', 'recovery_email')) {
                 Schema::table('users', function ($table) {
@@ -2470,7 +2500,6 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
         $userBaru = false;
 
         if (!$user) {
-            // USER BARU -> Otomatis daftarkan ke tabel users & hubungkan/buat customers
             $userBaru = true;
             $result = DB::transaction(function () use ($nama, $email) {
                 $userData = [
@@ -2486,7 +2515,6 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
 
                 $newUser = User::create($userData);
 
-                // Cek dulu apakah data customer dengan email ini sudah pernah dibuat oleh Admin
                 $existingCustomer = null;
                 if (Schema::hasColumn('customers', 'email')) {
                     $existingCustomer = Customer::whereRaw('LOWER(email) = ?', [$email])->first();
@@ -2543,7 +2571,6 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
                 'INFO'
             );
         } else {
-            // USER LAMA -> Ambil data customer yang terhubung
             if (Schema::hasColumn('customers', 'user_id')) {
                 $customer = Customer::where('user_id', $user->id)->first();
             }
@@ -2584,19 +2611,26 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
         Log::error('Gagal /google-login: ' . $e->getMessage());
         return response()->json([
             'success' => false,
-            'message' => 'Gagal login Google: ' . $e->getMessage(),
+            'message' => 'Gagal login Google: ' . $safeErrorMessage($e),
         ], 500);
     }
-});
+})->middleware('throttle:15,1');
 
-// Logout
-Route::post('/logout', function (Request $request) {
+// Logout (Hapus token Sanctum dari database)
+Route::post('/logout', function (Request $request) use ($resolveCurrentUser) {
     try {
-        if (Auth::check()) {
-            $user = Auth::user();
-            if (method_exists($user, 'tokens')) {
-                $user->tokens()->delete();
+        if ($bearer = $request->bearerToken()) {
+            if (class_exists(\Laravel\Sanctum\PersonalAccessToken::class)) {
+                $tokenModel = \Laravel\Sanctum\PersonalAccessToken::findToken($bearer);
+                if ($tokenModel) {
+                    $tokenModel->delete();
+                    return response()->json(['success' => true, 'message' => 'Berhasil logout'], 200);
+                }
             }
+        }
+        $user = $resolveCurrentUser($request);
+        if ($user && method_exists($user, 'tokens')) {
+            $user->tokens()->delete();
         }
         return response()->json(['success' => true, 'message' => 'Berhasil logout'], 200);
     } catch (\Throwable $e) {
