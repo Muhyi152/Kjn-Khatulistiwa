@@ -29,6 +29,13 @@ class CustomerController extends Controller
         'OPEN',
     ];
 
+    private const PAID_INVOICE_STATUSES = [
+        'PAID',
+        'LUNAS',
+        'SETTLEMENT',
+        'SUCCESS',
+    ];
+
     private function safeErrorMessage(\Throwable $e, string $fallback = 'Terjadi kesalahan pada server.'): string
     {
         return config('app.debug') ? $e->getMessage() : $fallback;
@@ -49,19 +56,18 @@ class CustomerController extends Controller
             $allProducts = Product::all()->keyBy('id');
             $customers = Customer::orderBy('id', 'desc')->get();
 
-            // Ambil semua invoice belum lunas dalam 1 query (hindari N+1 query)
+            // Ambil seluruh invoice milik daftar customer dalam 1 query
             $customerIds = $customers->pluck('id')->all();
-            $pendingInvoicesByCustomer = collect();
+            $invoicesByCustomer = collect();
 
             if (!empty($customerIds) && Schema::hasTable('invoices')) {
-                $pendingInvoicesByCustomer = Invoice::whereIn('customer_id', $customerIds)
-                    ->whereIn(DB::raw('UPPER(TRIM(status))'), self::UNPAID_INVOICE_STATUSES)
+                $invoicesByCustomer = Invoice::whereIn('customer_id', $customerIds)
                     ->orderBy('id', 'desc')
                     ->get()
                     ->groupBy('customer_id');
             }
 
-            $data = $customers->map(function ($c) use ($allProducts, $pendingInvoicesByCustomer) {
+            $data = $customers->map(function ($c) use ($allProducts, $invoicesByCustomer) {
                 $product = $c->product_id ? $allProducts->get($c->product_id) : null;
                 if (!$product && $allProducts->isNotEmpty()) {
                     $product = $allProducts->first();
@@ -76,22 +82,35 @@ class CustomerController extends Controller
                 $statusUpper = strtoupper(trim((string) ($c->status ?? 'ACTIVE')));
                 $isAktif = $this->isStatusAktif($statusUpper);
 
-                $customerPendingInvoices = $pendingInvoicesByCustomer->get($c->id, collect());
-                $pendingInvoice = $customerPendingInvoices->first();
+                $customerInvoices = $invoicesByCustomer->get($c->id, collect());
 
-                // Jumlahkan seluruh invoice yang belum dibayar
-                $tagihanRiil = (double) $customerPendingInvoices->sum(function ($inv) {
+                $pendingInvoices = $customerInvoices->filter(function ($inv) {
+                    $st = strtoupper(trim((string) ($inv->status ?? '')));
+                    return in_array($st, self::UNPAID_INVOICE_STATUSES, true);
+                });
+
+                $paidInvoices = $customerInvoices->filter(function ($inv) {
+                    $st = strtoupper(trim((string) ($inv->status ?? '')));
+                    return in_array($st, self::PAID_INVOICE_STATUSES, true);
+                });
+
+                $pendingInvoice = $pendingInvoices->first();
+
+                // Murni dari invoice yang belum dibayar; jika tidak ada = 0.0
+                $tagihanRiil = (double) $pendingInvoices->sum(function ($inv) {
                     return (double) ($inv->total_tagihan ?? $inv->amount ?? $inv->total ?? $inv->nominal ?? 0);
                 });
 
-                // Sinkronisasi: Jika status ISOLIR / NONAKTIF tapi belum ada record invoice unpaid,
-                // pastikan tagihan tidak terbaca 0 (LUNAS)
-                if (!$isAktif && $tagihanRiil <= 0 && $tarifPaket > 0) {
-                    $tagihanRiil = $tarifPaket;
-                }
+                $pernahBayar = $paidInvoices->isNotEmpty();
+                $isLunas = $isAktif && ($tagihanRiil <= 0) && $pernahBayar;
 
-                $isLunas = $isAktif && ($tagihanRiil <= 0) && !$pendingInvoice;
-                $statusTagihan = $isLunas ? 'LUNAS' : 'BELUM_BAYAR';
+                if ($tagihanRiil > 0 || $pendingInvoice) {
+                    $statusTagihan = 'BELUM_BAYAR';
+                } elseif ($isLunas) {
+                    $statusTagihan = 'LUNAS';
+                } else {
+                    $statusTagihan = 'TIDAK_ADA_TAGIHAN';
+                }
 
                 $namaVal   = ($c->nama ?? null) ?: (($c->name ?? null) ?: 'Pelanggan #' . $c->id);
                 $noWaVal   = ($c->no_wa ?? null) ?: (($c->no_hp ?? null) ?: (($c->phone ?? null) ?: '-'));
@@ -285,7 +304,6 @@ class CustomerController extends Controller
 
             $updateData = [];
             $namaBaru = null;
-            $statusBaru = null;
 
             if ($request->hasAny(['nama', 'name', 'nama_pelanggan'])) {
                 $namaBaru = mb_substr(trim((string) ($request->input('nama') ?? $request->input('name') ?? $request->input('nama_pelanggan') ?? '')), 0, 150);
@@ -326,7 +344,6 @@ class CustomerController extends Controller
             if ($request->hasAny(['status', 'status_langganan'])) {
                 $rawStatus = (string) ($request->input('status') ?? $request->input('status_langganan') ?? 'ACTIVE');
                 $normalizedStatus = $this->normalizeCustomerStatus($rawStatus);
-                $statusBaru = $normalizedStatus;
 
                 if (Schema::hasColumn('customers', 'status')) {
                     $updateData['status'] = $normalizedStatus;
@@ -383,11 +400,6 @@ class CustomerController extends Controller
 
             $fresh = Customer::find($customer->id);
 
-            // Sinkronisasi invoice saat status diubah menjadi ISOLIR
-            if ($statusBaru !== null && !$this->isStatusAktif($statusBaru) && $fresh) {
-                $this->pastikanInvoiceTunggakanAda($fresh, $product);
-            }
-
             return response()->json([
                 'success' => true,
                 'message' => 'Data pelanggan berhasil diperbarui',
@@ -399,63 +411,6 @@ class CustomerController extends Controller
                 'success' => false,
                 'message' => 'Gagal mengubah pelanggan: ' . $this->safeErrorMessage($e),
             ], 500);
-        }
-    }
-
-    /**
-     * Buat invoice UNPAID otomatis jika pelanggan di-isolir namun belum punya invoice tertunggak
-     */
-    private function pastikanInvoiceTunggakanAda(Customer $customer, ?Product $product = null): void
-    {
-        try {
-            if (!Schema::hasTable('invoices')) return;
-
-            $sudahAdaTunggakan = Invoice::where('customer_id', $customer->id)
-                ->whereIn(DB::raw('UPPER(TRIM(status))'), self::UNPAID_INVOICE_STATUSES)
-                ->exists();
-
-            if ($sudahAdaTunggakan) return;
-
-            $paket = $product ?? ($customer->product_id ? Product::find($customer->product_id) : null);
-            $tarif = $paket ? (double) ($paket->harga ?? $paket->price ?? 0) : 0.0;
-            if ($tarif <= 0) return;
-
-            $invoiceData = [
-                'customer_id' => $customer->id,
-                'status'      => 'UNPAID',
-            ];
-
-            if (Schema::hasColumn('invoices', 'user_id') && !empty($customer->user_id)) {
-                $invoiceData['user_id'] = $customer->user_id;
-            }
-            if (Schema::hasColumn('invoices', 'product_id') && $paket) {
-                $invoiceData['product_id'] = $paket->id;
-            }
-            if (Schema::hasColumn('invoices', 'nomor_invoice')) {
-                $invoiceData['nomor_invoice'] = 'INV-' . now()->format('Ymd') . '-' . str_pad((string) $customer->id, 3, '0', STR_PAD_LEFT) . strtoupper(Str::random(3));
-            }
-            if (Schema::hasColumn('invoices', 'total_tagihan')) {
-                $invoiceData['total_tagihan'] = $tarif;
-            }
-            if (Schema::hasColumn('invoices', 'amount')) {
-                $invoiceData['amount'] = $tarif;
-            }
-            if (Schema::hasColumn('invoices', 'nominal')) {
-                $invoiceData['nominal'] = $tarif;
-            }
-            if (Schema::hasColumn('invoices', 'jatuh_tempo')) {
-                $invoiceData['jatuh_tempo'] = now()->toDateString();
-            }
-            if (Schema::hasColumn('invoices', 'created_at')) {
-                $invoiceData['created_at'] = now();
-            }
-            if (Schema::hasColumn('invoices', 'updated_at')) {
-                $invoiceData['updated_at'] = now();
-            }
-
-            DB::table('invoices')->insert($invoiceData);
-        } catch (\Throwable $e) {
-            Log::warning('Auto-create invoice isolir dilewati: ' . $e->getMessage());
         }
     }
 
