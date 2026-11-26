@@ -421,6 +421,9 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
 
     $namaPaketBersih = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $namaPaketAktif);
 
+    $dbStatusUpper = strtoupper(trim((string) ($customer->status ?? '')));
+    $dbDiIsolir = in_array($dbStatusUpper, ['ISOLIR', 'SUSPEND', 'SUSPENDED', 'BLOKIR'], true);
+
     if ($invPending) {
         $tagihanRiil = (double) $invPending->total_tagihan;
         $pendingProd = empty($invPending->nama_produk) ? $resolveProductFromInvoice($invPending, $customer) : null;
@@ -429,9 +432,9 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
             : ($pendingProd ? ($pendingProd->nama_paket ?? $pendingProd->name) : 'Paket Baru');
         $namaPaketPending = preg_replace('/^Pembayaran\s+Paket\s+/i', '', $rawPendingName);
 
-        $statusLangganan = $masihMasaAktif ? 'AKTIF' : 'BELUM_AKTIF';
-        $statusKoneksi   = $masihMasaAktif ? 'Online' : 'Offline';
-        $isOnline        = $masihMasaAktif;
+        $statusLangganan = $dbDiIsolir ? 'ISOLIR' : ($masihMasaAktif ? 'AKTIF' : 'BELUM_AKTIF');
+        $statusKoneksi   = (!$dbDiIsolir && $masihMasaAktif) ? 'Online' : 'Offline';
+        $isOnline        = !$dbDiIsolir && $masihMasaAktif;
         $nomorInvoice    = $invPending->nomor_invoice;
         $tenggatWaktu    = "Menunggu Pembayaran: {$namaPaketPending}";
 
@@ -439,22 +442,24 @@ $formatCustomerProfile = function ($customer = null, Request $request = null) us
         $tglJatuhTempoStr = $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : '-';
     } elseif ($lastPaid) {
         $tagihanRiil = 0.0;
-        $statusLangganan = $masihMasaAktif ? 'AKTIF' : 'ISOLIR';
-        $statusKoneksi   = $masihMasaAktif ? 'Online' : 'Offline';
-        $isOnline        = $masihMasaAktif;
+        $statusLangganan = $dbDiIsolir ? 'ISOLIR' : ($masihMasaAktif ? 'AKTIF' : 'ISOLIR');
+        $statusKoneksi   = (!$dbDiIsolir && $masihMasaAktif) ? 'Online' : 'Offline';
+        $isOnline        = !$dbDiIsolir && $masihMasaAktif;
         $nomorInvoice    = null;
         $tglBeli         = $tglBeliCarbon->format('d M Y');
         $tglJatuhTempoStr= $tglJatuhTempoCarbon ? $tglJatuhTempoCarbon->format('d M Y') : '-';
-        $tenggatWaktu    = $masihMasaAktif ? "LUNAS • Aktif s.d. {$tglJatuhTempoStr}" : "MASA AKTIF HABIS (Isolir)";
+        $tenggatWaktu    = $dbDiIsolir
+            ? 'Layanan Diisolir Admin'
+            : ($masihMasaAktif ? "LUNAS • Aktif s.d. {$tglJatuhTempoStr}" : "MASA AKTIF HABIS (Isolir)");
     } else {
         $tagihanRiil     = 0.0;
-        $statusLangganan = 'BELUM_AKTIF';
+        $statusLangganan = $dbDiIsolir ? 'ISOLIR' : 'BELUM_AKTIF';
         $statusKoneksi   = 'Offline';
         $isOnline        = false;
         $nomorInvoice    = null;
         $tglBeli         = '-';
         $tglJatuhTempoStr= '-';
-        $tenggatWaktu    = 'Belum Ada Langganan';
+        $tenggatWaktu    = $dbDiIsolir ? 'Layanan Diisolir Admin' : 'Belum Ada Langganan';
     }
 
     return response()->json([
@@ -526,13 +531,14 @@ $handlerAdminDashboard = function (Request $request) use ($resolveProductFromInv
         $totalCustomers = (int) $allCustomers->count();
 
         $activeConnections = (int) $allCustomers->filter(function ($c) {
-            $st = strtoupper(trim($c->status ?? ''));
-            $conn = strtolower(trim($c->status_koneksi ?? ''));
-            return in_array($st, ['ACTIVE', 'AKTIF', 'ONLINE', 'ENABLE', 'ENABLED', '1'])
-                || in_array($conn, ['online', 'aktif', 'terhubung', 'connected']);
+            $st = strtoupper(trim((string) ($c->status ?? '')));
+            if ($st !== '') {
+                return in_array($st, ['ACTIVE', 'AKTIF', 'ONLINE', 'ENABLE', 'ENABLED', '1'], true);
+            }
+            $conn = strtolower(trim((string) ($c->status_koneksi ?? '')));
+            return in_array($conn, ['online', 'aktif', 'terhubung', 'connected'], true);
         })->count();
 
-        if ($activeConnections === 0 && $totalCustomers > 0) $activeConnections = $totalCustomers;
         $isolatedCustomers = max(0, $totalCustomers - $activeConnections);
 
         $allInvoices = Invoice::orderBy('id', 'desc')->get();
@@ -2016,7 +2022,6 @@ Route::post('/google-login', function (Request $request) use ($createNotificatio
         ], 500);
     }
 })->middleware('throttle:15,1');
-
 
 // =========================================================================
 // OTP WHATSAPP VIA FONNTE (AMAN DI BACKEND + ANTI BRUTE-FORCE)
