@@ -13,6 +13,7 @@ class Customer extends Model
 
     // Sesuaikan HANYA dengan kolom yang benar-benar ada di tabel database Anda
     protected $fillable = [
+        'user_id',
         'product_id',
         'nama',
         'no_wa',
@@ -32,6 +33,22 @@ class Customer extends Model
     public function product()
     {
         return $this->belongsTo(Product::class, 'product_id');
+    }
+
+    /**
+     * Relasi ke Model User (belongsTo)
+     */
+    public function user()
+    {
+        return $this->belongsTo(User::class, 'user_id');
+    }
+
+    /**
+     * Relasi ke Model Invoice (hasMany)
+     */
+    public function invoices()
+    {
+        return $this->hasMany(Invoice::class, 'customer_id');
     }
 
     /**
